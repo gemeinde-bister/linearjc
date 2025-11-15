@@ -154,7 +154,6 @@ linearjc/
 ├── src/
 │   ├── coordinator/           # Python coordinator
 │   └── executor/              # Rust executor
-├── examples/                  # Example configs and jobs
 └── examples/                  # Example configs and jobs
 ```
 
