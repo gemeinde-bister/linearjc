@@ -1,0 +1,53 @@
+[package]
+name = "linearjc-executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# ============================================================================
+# SECURITY NOTICE: Dependencies are pinned to exact versions to prevent
+# supply chain attacks. Review and update manually after auditing changes.
+# ============================================================================
+
+# MQTT client - communication with coordinator
+rumqttc = "=0.24.0"
+
+# Serialization - job request parsing
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+
+# HTTP client - downloading/uploading job data from/to Minio
+# Uses rustls (pure Rust TLS) instead of OpenSSL for supply chain security
+reqwest = { version = "=0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Logging infrastructure
+env_logger = "=0.11.8"
+log = "=0.4.28"
+
+# Error handling
+anyhow = "=1.0.100"
+
+# Cryptography - HMAC-SHA256 message signing
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+hex = "=0.4.3"
+
+# Constant-time operations - prevents timing attacks on signature verification
+# CRITICAL: Used for secure signature comparison
+subtle = "=2.6.1"
+
+# Time handling - timestamp validation
+chrono = "=0.4.42"
+
+# Unix operations - setuid, chown, fork for privilege separation
+nix = { version = "=0.29.0", features = ["user", "process", "fs"] }
+
+# Archive handling - replaces tar subprocess (prevents command injection)
+# CRITICAL: Used instead of tar(1) to prevent shell injection attacks
+tar = "=0.4.44"
+flate2 = "=1.1.5"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
