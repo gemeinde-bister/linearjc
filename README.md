@@ -85,23 +85,41 @@ pip install -r requirements.txt
 
 Start services (development)
 ```bash
-./run-mosquitto.sh
-./run-minio.sh
+# Mosquitto (example - distro package)
+mosquitto -v
+
+# MinIO (example - download binary)
+wget https://dl.min.io/server/minio/release/linux-amd64/minio -O ./minio
+chmod +x ./minio
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+  ./minio server /tmp/minio-data --console-address ":9001"
 ```
 
-Run executor (uses `MQTT_SHARED_SECRET`; replace for production)
+Build and run executor (replace secret for production)
 ```bash
-sudo ./run-executor-root.sh
+cd src/executor
+cargo build --release
+EXECUTOR_ID=executor-01 \
+JOBS_DIR=$PWD/../../examples/executor-jobs \
+WORK_DIR=/tmp/linearjc-executor \
+MQTT_BROKER=localhost MQTT_PORT=1883 MQTT_SHARED_SECRET=dev-secret-change-in-production \
+sudo ../../target/release/linearjc-executor
 ```
 
-Run coordinator with the test configuration
+Run coordinator with example configuration (copy and edit .sample files)
 ```bash
-python src/coordinator/main.py --config test-env/config/config.yaml
+# Copy example configs to /etc and adjust (secrets, paths)
+sudo mkdir -p /etc/linearjc /etc/linearjc/executor /var/log/linearjc
+sudo cp examples/config.yaml.sample /etc/linearjc/config.yaml
+sudo cp examples/data_registry.yaml.sample /etc/linearjc/data_registry.yaml
+sudo cp -r examples/jobs /etc/linearjc/
+
+# Run coordinator
+python src/coordinator/main.py --config /etc/linearjc/config.yaml
 ```
 
 Notes
-- Example configs include development defaults (`minioadmin`, a sample shared secret). Replace for production.
-- Logs are written to `test-env/logs/` in the test configuration.
+- Example configs include development defaults (`minioadmin`, a sample shared secret). Replace before production and enable TLS.
 
 ## Configuration
 
@@ -137,7 +155,7 @@ linearjc/
 │   ├── coordinator/           # Python coordinator
 │   └── executor/              # Rust executor
 ├── examples/                  # Example configs and jobs
-└── test-env/                  # Local test environment assets
+└── examples/                  # Example configs and jobs
 ```
 
 ## License
