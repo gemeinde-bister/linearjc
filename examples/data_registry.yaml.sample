@@ -1,0 +1,30 @@
+# LinearJC Data Registry (example)
+#
+# Copy to /etc/linearjc/data_registry.yaml or another location and adjust paths.
+
+registry:
+  hello_input:
+    type: filesystem
+    path: /tmp/linearjc/data/hello_input.txt
+    readable: true
+    writable: true
+
+  hello_output:
+    type: filesystem
+    path: /tmp/linearjc/data/hello_output.txt
+    readable: true
+    writable: true
+
+  followup_output:
+    type: filesystem
+    path: /tmp/linearjc/data/followup_output.txt
+    readable: true
+    writable: true
+
+  # Example Minio entry (uncomment and adjust)
+  # intermediate_data:
+  #   type: minio
+  #   bucket: job-artifacts
+  #   prefix: hello/intermediate
+  #   retention_days: 7
+
