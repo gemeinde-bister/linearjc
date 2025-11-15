@@ -1,0 +1,30 @@
+# Hello Followup Job
+# Depends on hello.world
+
+job:
+  # Unique identifier
+  id: hello.followup
+  version: "1.0.0"
+
+  # Depends on hello.world
+  depends_on:
+    - hello.world
+
+  # Schedule: must align with hello.world (32-48 times/day for load testing)
+  # Tree schedule will be: min=32 (max of 32,32), max=48 (min of 48,48)
+  schedule:
+    min_daily: 32
+    max_daily: 48
+
+  # Executor configuration
+  executor:
+    user: nobody
+    timeout: 300
+
+  # Inputs: uses hello.world's output
+  inputs:
+    previous_output: hello_output
+
+  # Outputs
+  outputs:
+    final_output: followup_output

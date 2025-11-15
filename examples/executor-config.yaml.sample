@@ -1,0 +1,62 @@
+# LinearJC Executor Configuration (example)
+#
+# Copy to /etc/linearjc/executor/config.yaml or another location and adjust.
+
+executor:
+  id: executor-01
+  hostname: localhost
+
+  mqtt:
+    broker: localhost
+    port: 1883
+    keepalive: 60
+
+  jobs_dir: /etc/linearjc/executor/jobs
+  work_dir: /tmp/linearjc
+
+  announce_interval: 300
+
+  signing:
+    shared_secret: "dev-secret-change-in-production"
+
+  logging:
+    level: INFO
+    file: /var/log/linearjc/executor.log
+# LinearJC Executor Configuration (Sample)
+#
+# IMPORTANT: This is a sample configuration with placeholders.
+# Copy this file to executor-config.yaml and replace ALL placeholder values.
+#
+# DO NOT commit executor-config.yaml to version control!
+#
+
+executor:
+  # Unique executor identifier
+  id: executor-01
+  hostname: localhost
+
+  # MQTT broker connection
+  mqtt:
+    broker: localhost
+    port: 1883
+    keepalive: 60
+
+  # Job scripts location
+  jobs_dir: /etc/linearjc/executor/jobs
+
+  # Working directory for job execution
+  work_dir: /tmp/linearjc
+
+  # Capability announcement (deprecated - now uses poll-based)
+  announce_interval: 300  # Every 5 minutes
+
+  # Message signing
+  signing:
+    # REQUIRED: Generate a secure shared secret (MUST MATCH COORDINATOR)
+    # Generate with: python3 -c 'import secrets; print(secrets.token_hex(32))'
+    shared_secret: "YOUR_SHARED_SECRET_HERE_MIN_32_CHARS"
+
+  # Logging
+  logging:
+    level: INFO
+    file: /var/log/linearjc/executor.log

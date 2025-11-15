@@ -1,0 +1,28 @@
+# Hello World Job
+# Root job with no dependencies
+
+job:
+  # Unique identifier
+  id: hello.world
+  version: "1.0.0"
+
+  # No dependencies (root job)
+  depends_on: []
+
+  # Schedule: run 32-48 times per day (every 30-45 minutes for load testing)
+  schedule:
+    min_daily: 32
+    max_daily: 48
+
+  # Executor configuration
+  executor:
+    user: nobody  # For PoC, use current user
+    timeout: 300  # 5 minutes
+
+  # Inputs from data registry
+  inputs:
+    input_file: hello_input
+
+  # Outputs to data registry
+  outputs:
+    output_file: hello_output

@@ -1,0 +1,108 @@
+# LinearJC Coordinator Configuration (example)
+#
+# Copy to /etc/linearjc/config.yaml or another location and adjust for your environment.
+# Replace secrets and enable TLS in production.
+
+coordinator:
+  mqtt:
+    broker: localhost
+    port: 1883
+    keepalive: 60
+
+  minio:
+    endpoint: localhost:9000
+    access_key: minioadmin
+    secret_key: minioadmin
+    secure: false
+    temp_bucket: linearjc-temp
+
+  jobs_dir: /etc/linearjc/jobs
+  data_registry: /etc/linearjc/data_registry.yaml
+
+  scheduling:
+    loop_interval: 10
+    message_max_age: 60
+
+  signing:
+    shared_secret: "dev-secret-change-in-production"
+
+  logging:
+    level: INFO
+    file: /var/log/linearjc/coordinator.log
+# LinearJC Coordinator Configuration (Sample)
+#
+# IMPORTANT: This is a sample configuration with placeholders.
+# Copy this file to config.yaml and replace ALL placeholder values.
+#
+# DO NOT commit config.yaml to version control!
+#
+
+coordinator:
+  # MQTT broker connection
+  mqtt:
+    broker: localhost
+    port: 1883
+    keepalive: 60
+
+  # Minio connection (S3-compatible object storage)
+  minio:
+    endpoint: localhost:9000
+    # REQUIRED: Replace with your actual Minio credentials
+    # Generate with: openssl rand -hex 20
+    access_key: YOUR_MINIO_ACCESS_KEY_HERE
+    secret_key: YOUR_MINIO_SECRET_KEY_HERE
+    secure: false  # Set to true for HTTPS in production
+    temp_bucket: linearjc-temp
+
+  # Job discovery
+  jobs_dir: /etc/linearjc/jobs
+  data_registry: /etc/linearjc/data_registry.yaml
+
+  # Working directory for temporary files during job execution
+  # Ensure this directory has sufficient disk space for your largest job inputs/outputs
+  # Recommendation: Use a directory on a volume with plenty of space
+  work_dir: /var/lib/linearjc/work
+
+  # Scheduling
+  scheduling:
+    loop_interval: 10  # Check every 10 seconds
+    message_max_age: 60  # Reject messages older than 60 seconds
+
+  # Message signing
+  signing:
+    # REQUIRED: Generate a secure shared secret
+    # Generate with: python3 -c 'import secrets; print(secrets.token_hex(32))'
+    shared_secret: "YOUR_SHARED_SECRET_HERE_MIN_32_CHARS"
+
+  # Security configuration
+  security:
+    # Allowed root directories for data registry filesystem paths
+    # Only paths within these directories will be accepted
+    allowed_data_roots:
+      - /data
+      - /tmp/linearjc
+    # Validate secrets at startup (recommended: true)
+    validate_secrets: true
+
+  # Logging configuration
+  logging:
+    # Global log level: DEBUG, INFO, WARNING, ERROR
+    level: INFO
+
+    # Optional: Log to file (in addition to stdout)
+    # file: /var/log/linearjc/coordinator.log
+
+    # Output format: false = human-readable, true = JSON (for log aggregation)
+    json_format: false
+
+    # Optional: Per-module log levels for fine-grained control
+    # Useful for debugging specific components without flooding logs
+    # module_levels:
+    #   mqtt_client: DEBUG      # Verbose MQTT debugging
+    #   minio_manager: WARNING  # Only warnings from Minio
+    #   job_executor: DEBUG     # Debug job execution
+    #   scheduler: INFO         # Normal scheduler logs
+
+  # Archive format configuration
+  archive:
+    format: tar.gz  # Only tar.gz supported in v0.1
