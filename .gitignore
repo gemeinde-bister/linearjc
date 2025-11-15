@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+/var/log/linearjc/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data
+/tmp/linearjc/
+test-env/minio-data/
+test-env/minio-test/
+
+# Configuration files with secrets (DO NOT COMMIT)
+config.yaml
+executor-config.yaml
+**/config.yaml
+**/executor-config.yaml
+# Keep .sample files
+!*.sample
+
+# Binaries
+bin/minio
+bin/mc
