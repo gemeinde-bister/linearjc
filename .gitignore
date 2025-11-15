@@ -8,11 +8,14 @@ venv/
 env/
 ENV/
 .venv
+build/
+dist/
+*.egg-info/
+**/*.egg-info/
 
 # Rust
-/target/
+target/
 **/*.rs.bk
-Cargo.lock
 
 # Go
 *.exe
@@ -41,6 +44,7 @@ Thumbs.db
 
 # Local data
 /tmp/linearjc/
+test-env/
 test-env/minio-data/
 test-env/minio-test/
 
@@ -49,6 +53,9 @@ config.yaml
 executor-config.yaml
 **/config.yaml
 **/executor-config.yaml
+# Data registry files may contain local paths and should not be committed
+data_registry.yaml
+**/data_registry.yaml
 # Keep .sample files
 !*.sample
 
