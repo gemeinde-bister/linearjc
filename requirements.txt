@@ -1,0 +1,28 @@
+# LinearJC Coordinator Requirements
+
+# MQTT client
+paho-mqtt==1.6.1
+
+# YAML parsing
+PyYAML==6.0.1
+
+# Data validation and models
+pydantic>=2.8.0
+
+# Minio client (for Phase 2)
+minio==7.2.0
+
+# Type hints (Python 3.9+ compatibility)
+typing-extensions>=4.12.2
+
+# For message signing
+cryptography==41.0.7
+
+# CLI framework
+click==8.1.7
+
+# For development
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.12.1
+mypy==1.7.1
