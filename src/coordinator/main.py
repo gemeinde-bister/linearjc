@@ -436,7 +436,9 @@ class Coordinator:
         """
         Find tree by its tree_execution_id.
 
-        The tree_execution_id format is: {job_id}-{timestamp}-{uuid}
+        The tree_execution_id format is: {job_id}-{YYYYMMDD}-{HHMMSS}-{uuid8}
+        Example: hello.world-20251116-131651-c4630045
+
         We extract the job_id and match against tree.root.id.
 
         Args:
@@ -447,14 +449,16 @@ class Coordinator:
 
         Note:
             This is O(n) but trees list is small (typically < 10).
+            We split from the right to preserve job IDs that contain hyphens.
         """
         if not tree_execution_id:
             return None
 
-        # Extract job ID from tree_execution_id (format: job_id-timestamp-uuid)
+        # Extract job ID from tree_execution_id (format: job_id-YYYYMMDD-HHMMSS-uuid8)
         # Split from the right to handle job IDs that may contain hyphens
-        parts = tree_execution_id.rsplit('-', 2)
-        if len(parts) < 3:
+        # Example: "my-job-20251116-131651-c4630045" -> ["my-job", "20251116", "131651", "c4630045"]
+        parts = tree_execution_id.rsplit('-', 3)
+        if len(parts) < 4:
             logger.warning(f"Invalid tree_execution_id format: {tree_execution_id}")
             return None
 
