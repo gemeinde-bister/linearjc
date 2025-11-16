@@ -1,30 +1,33 @@
 # LinearJC Data Registry (example)
 #
 # Copy to /etc/linearjc/data_registry.yaml or another location and adjust paths.
+#
+# Format (compact YAML for better grep-ability):
+#   name: {type: filesystem, path_type: file|directory, path: /path, readable: bool, writable: bool}
+#   name: {type: minio, bucket: bucket-name, prefix: prefix/, retention_days: N}
+#
+# Path Type:
+#   - file: Single file (validates archive contains exactly one file)
+#   - directory: Directory with contents (extracts full structure)
+#
+# Following mainframe philosophy: explicit > implicit
+# Declare what you're creating, and LinearJC validates it matches.
 
 registry:
-  hello_input:
-    type: filesystem
-    path: /tmp/linearjc/data/hello_input.txt
-    readable: true
-    writable: true
+  # Input: Single text file
+  hello_input: {type: filesystem, path_type: file, path: /tmp/linearjc/data/hello_input.txt, readable: true, writable: true}
 
-  hello_output:
-    type: filesystem
-    path: /tmp/linearjc/data/hello_output.txt
-    readable: true
-    writable: true
+  # Output: Directory containing job results (hello.world creates multiple files)
+  hello_output: {type: filesystem, path_type: directory, path: /tmp/linearjc/data/hello_output, readable: true, writable: true}
 
-  followup_output:
-    type: filesystem
-    path: /tmp/linearjc/data/followup_output.txt
-    readable: true
-    writable: true
+  # Output: Directory for followup job results
+  followup_output: {type: filesystem, path_type: directory, path: /tmp/linearjc/data/followup_output, readable: true, writable: true}
 
-  # Example Minio entry (uncomment and adjust)
-  # intermediate_data:
-  #   type: minio
-  #   bucket: job-artifacts
-  #   prefix: hello/intermediate
-  #   retention_days: 7
+  # Example: MinIO storage for intermediate data
+  # intermediate_data: {type: minio, bucket: job-artifacts, prefix: hello/intermediate/, retention_days: 7}
 
+  # Example: Single file output (if job creates exactly one file)
+  # report_csv: {type: filesystem, path_type: file, path: /tmp/linearjc/data/daily_report.csv, readable: true, writable: true}
+
+  # Example: Directory output with specific structure
+  # website_build: {type: filesystem, path_type: directory, path: /var/www/html/site, readable: true, writable: false}
