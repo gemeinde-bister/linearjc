@@ -86,6 +86,10 @@ class DataRegistryEntry(BaseModel):
     type: str = Field(description="Storage type: filesystem or minio")
     # Filesystem fields
     path: Optional[str] = None
+    path_type: Optional[str] = Field(
+        default=None,
+        description="Path type for filesystem: 'file' or 'directory'"
+    )
     readable: Optional[bool] = True
     writable: Optional[bool] = True
     # Minio fields
@@ -119,6 +123,24 @@ class DataRegistryEntry(BaseModel):
             validate_path(v, allowed_roots=None, allow_relative=False, description="registry path")
         except Exception as e:
             raise ValueError(f"Invalid path in registry: {e}")
+
+        return v
+
+    @field_validator('path_type')
+    @classmethod
+    def validate_path_type(cls, v: Optional[str], info) -> Optional[str]:
+        """Validate path_type field."""
+        if v is None:
+            return v
+
+        # path_type only valid for filesystem type
+        entry_type = info.data.get('type')
+        if entry_type != 'filesystem':
+            raise ValueError(f"path_type only valid for filesystem type, not {entry_type}")
+
+        # Must be 'file' or 'directory'
+        if v not in ['file', 'directory']:
+            raise ValueError(f"path_type must be 'file' or 'directory', got: {v}")
 
         return v
 

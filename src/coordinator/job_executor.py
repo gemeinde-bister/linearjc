@@ -451,18 +451,22 @@ class JobExecutor:
         execution_dir: Path
     ) -> None:
         """
-        Collect output to filesystem: download → extract.
+        Collect output to filesystem: download → extract → validate.
 
         Uses per-path locking to ensure atomic writes when multiple jobs
         write to the same destination.
 
         Args:
             output_name: Logical output name
-            registry_entry: Registry entry with filesystem path
+            registry_entry: Registry entry with filesystem path and path_type
             tree_execution_id: Execution ID
             execution_dir: Working directory
+
+        Raises:
+            JobExecutorError: If extraction or validation fails
         """
         dest_path = registry_entry.path
+        path_type = registry_entry.path_type or 'directory'  # Default for backward compatibility
 
         # Download archive from Minio (format from config)
         archive_filename = f"output_{output_name}.{self.archive_format}"
@@ -480,10 +484,26 @@ class JobExecutor:
         # This ensures atomic writes when multiple jobs target same path
         logger.debug(f"Acquiring lock for filesystem path: {dest_path}")
         with self.output_lock_manager.acquire(dest_path):
-            logger.debug(f"Extracting {self.archive_format} archive: {archive_path} -> {dest_path}")
-            extract_archive(str(archive_path), dest_path)
+            logger.debug(
+                f"Extracting {self.archive_format} archive as {path_type}: "
+                f"{archive_path} -> {dest_path}"
+            )
+            extract_archive(str(archive_path), dest_path, path_type=path_type)
 
-        logger.info(f"Collected output '{output_name}' to {dest_path}")
+            # Validate extraction result matches declared path_type
+            dest = Path(dest_path)
+            if path_type == 'file' and not dest.is_file():
+                raise JobExecutorError(
+                    f"Expected file at {dest_path} but found "
+                    f"{'directory' if dest.is_dir() else 'nothing'}"
+                )
+            elif path_type == 'directory' and not dest.is_dir():
+                raise JobExecutorError(
+                    f"Expected directory at {dest_path} but found "
+                    f"{'file' if dest.is_file() else 'nothing'}"
+                )
+
+        logger.info(f"Collected output '{output_name}' to {dest_path} ({path_type})")
 
     def build_job_request(
         self,
