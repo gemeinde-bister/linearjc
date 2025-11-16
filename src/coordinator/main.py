@@ -413,11 +413,24 @@ class Coordinator:
             # Update job tracker
             self.job_tracker.handle_progress_update(job_execution_id, message)
 
-            # Unregister tree outputs when job completes (terminal state)
+            # Collect outputs and unregister when job completes (terminal state)
             if state in ('completed', 'failed', 'timeout'):
                 if tree_exec_id:
                     tree = self._find_tree_by_execution_id(tree_exec_id)
                     if tree:
+                        # Download outputs from MinIO and write to filesystem paths
+                        if state == 'completed':
+                            try:
+                                logger.info(f"Collecting outputs for {tree.root.id}")
+                                self.job_executor.collect_tree_outputs(tree, tree_exec_id)
+                                logger.info(f"Outputs collected successfully for {tree.root.id}")
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to collect outputs for {tree.root.id}: {e}",
+                                    exc_info=True
+                                )
+                                # Continue to unregister locks even if collection fails
+
                         logger.info(f"Unregistering tree outputs for {tree.root.id}")
                         self.tree_validator.unregister_tree(tree)
                     else:
@@ -498,6 +511,15 @@ class Coordinator:
                 logger.error(f"Cannot execute tree due to output conflict:\n{e}")
                 raise
 
+            # Update tree execution tracking immediately after lock registration
+            # This prevents the scheduler from trying to run the same tree again
+            # before it completes (avoiding self-conflict)
+            now = time.time()
+            tree.last_execution = now
+            ideal_interval = (24 * 3600) / tree.max_daily
+            tree.next_execution = now + ideal_interval
+            tree.record_execution(now)
+
             log_with_fields(
                 logger, logging.INFO, "Starting tree execution",
                 job_id=root_job.id,
@@ -539,8 +561,7 @@ class Coordinator:
             # Add assigned_to field
             job_request['assigned_to'] = executor_id
 
-            # Track job execution
-            now = time.time()
+            # Track job execution (reuse 'now' from tree tracking above)
             job_exec = JobExecution(
                 job_execution_id=job_execution_id,
                 tree_execution_id=tree_execution_id,
@@ -561,14 +582,6 @@ class Coordinator:
                 executor=executor_id
             )
             self.mqtt_client.publish_job_request(job_execution_id, job_request)
-
-            # Update tree execution tracking
-            tree.last_execution = now
-            ideal_interval = (24 * 3600) / tree.max_daily
-            tree.next_execution = now + ideal_interval
-
-            # Record execution in sliding history
-            tree.record_execution(now)
 
             log_with_fields(
                 logger, logging.INFO, "Tree scheduled successfully",
