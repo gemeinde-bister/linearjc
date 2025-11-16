@@ -20,6 +20,7 @@ from typing import Dict, Any
 from coordinator.models import Job, JobTree, DataRegistry, DataRegistryEntry
 from coordinator.minio_manager import MinioManager
 from coordinator.archive_handler import create_archive, extract_archive
+from coordinator.output_locks import OutputLockManager
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class JobExecutor:
         minio_manager: MinioManager,
         data_registry: Dict[str, DataRegistryEntry],
         temp_bucket: str,
+        output_lock_manager: OutputLockManager,
         archive_format: str = "tar.gz",
         work_dir: str = "/var/lib/linearjc/work"
     ):
@@ -51,12 +53,14 @@ class JobExecutor:
             minio_manager: Minio manager instance
             data_registry: Data registry mapping
             temp_bucket: Minio bucket for temporary job data
+            output_lock_manager: Manager for per-filesystem-path output locks
             archive_format: Archive format to use (from coordinator config)
             work_dir: Local working directory for temp files
         """
         self.minio = minio_manager
         self.data_registry = data_registry
         self.temp_bucket = temp_bucket
+        self.output_lock_manager = output_lock_manager
         self.archive_format = archive_format
         self.work_dir = Path(work_dir)
 
@@ -449,6 +453,9 @@ class JobExecutor:
         """
         Collect output to filesystem: download → extract.
 
+        Uses per-path locking to ensure atomic writes when multiple jobs
+        write to the same destination.
+
         Args:
             output_name: Logical output name
             registry_entry: Registry entry with filesystem path
@@ -469,9 +476,12 @@ class JobExecutor:
             str(archive_path)
         )
 
-        # Extract archive to destination
-        logger.debug(f"Extracting {self.archive_format} archive: {archive_path} -> {dest_path}")
-        extract_archive(str(archive_path), dest_path)
+        # Extract archive to destination WITH LOCK
+        # This ensures atomic writes when multiple jobs target same path
+        logger.debug(f"Acquiring lock for filesystem path: {dest_path}")
+        with self.output_lock_manager.acquire(dest_path):
+            logger.debug(f"Extracting {self.archive_format} archive: {archive_path} -> {dest_path}")
+            extract_archive(str(archive_path), dest_path)
 
         logger.info(f"Collected output '{output_name}' to {dest_path}")
 
