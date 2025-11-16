@@ -19,6 +19,8 @@ from coordinator.job_executor import JobExecutor
 from coordinator.mqtt_client import MqttClient
 from coordinator.capability_discovery import ExecutorRegistry
 from coordinator.job_tracker import JobTracker, JobExecution, JobState
+from coordinator.output_locks import OutputLockManager
+from coordinator.tree_validation import TreeOutputValidator, OutputConflictError
 from coordinator.logging_utils import (
     setup_logging,
     set_correlation_ids,
@@ -56,6 +58,8 @@ class Coordinator:
         self.mqtt_client = None
         self.executor_registry = None
         self.job_tracker = None
+        self.output_lock_manager = None
+        self.tree_validator = None
         self._reload_requested = False
 
     def load_config(self):
@@ -149,6 +153,10 @@ class Coordinator:
 
             logger.info(f"Loaded {len(self.data_registry)} registry entries")
 
+            # Create tree output validator for conflict detection
+            logger.info("Initializing tree output validator...")
+            self.tree_validator = TreeOutputValidator(self.data_registry)
+
         except Exception as e:
             logger.error(f"Failed to load data registry: {e}")
             raise
@@ -213,6 +221,9 @@ class Coordinator:
             # Reload jobs and rebuild trees
             self.discover_and_build_trees()
             self.validate_data_registry_references()
+
+            # Validate tree output configurations
+            self.tree_validator.validate_tree_configurations(self.trees)
 
             # Restore execution state for trees that still exist
             for tree in self.trees:
@@ -286,10 +297,15 @@ class Coordinator:
         logger.info("Initializing job executor...")
 
         try:
+            # Create output lock manager for atomic filesystem writes
+            logger.info("Initializing output lock manager...")
+            self.output_lock_manager = OutputLockManager()
+
             self.job_executor = JobExecutor(
                 minio_manager=self.minio_manager,
                 data_registry=self.data_registry,
                 temp_bucket=self.config.minio.temp_bucket,
+                output_lock_manager=self.output_lock_manager,
                 archive_format=self.config.archive.format,
                 work_dir=self.config.work_dir
             )
@@ -397,8 +413,58 @@ class Coordinator:
             # Update job tracker
             self.job_tracker.handle_progress_update(job_execution_id, message)
 
+            # Unregister tree outputs when job completes (terminal state)
+            if state in ('completed', 'failed', 'timeout'):
+                if tree_exec_id:
+                    tree = self._find_tree_by_execution_id(tree_exec_id)
+                    if tree:
+                        logger.info(f"Unregistering tree outputs for {tree.root.id}")
+                        self.tree_validator.unregister_tree(tree)
+                    else:
+                        logger.warning(
+                            f"Could not find tree for execution ID: {tree_exec_id}"
+                        )
+                else:
+                    logger.warning(
+                        f"No tree_execution_id in progress update for job {job_execution_id}"
+                    )
+
         finally:
             clear_correlation_ids()
+
+    def _find_tree_by_execution_id(self, tree_execution_id: str) -> Optional[JobTree]:
+        """
+        Find tree by its tree_execution_id.
+
+        The tree_execution_id format is: {job_id}-{timestamp}-{uuid}
+        We extract the job_id and match against tree.root.id.
+
+        Args:
+            tree_execution_id: Tree execution ID
+
+        Returns:
+            JobTree if found, None otherwise
+
+        Note:
+            This is O(n) but trees list is small (typically < 10).
+        """
+        if not tree_execution_id:
+            return None
+
+        # Extract job ID from tree_execution_id (format: job_id-timestamp-uuid)
+        # Split from the right to handle job IDs that may contain hyphens
+        parts = tree_execution_id.rsplit('-', 2)
+        if len(parts) < 3:
+            logger.warning(f"Invalid tree_execution_id format: {tree_execution_id}")
+            return None
+
+        job_id = parts[0]
+
+        for tree in self.trees:
+            if tree.root.id == job_id:
+                return tree
+
+        return None
 
     def execute_tree(self, tree: JobTree) -> str:
         """
@@ -420,6 +486,14 @@ class Coordinator:
         set_correlation_ids(tree_exec_id=tree_execution_id, job_exec_id=job_execution_id)
 
         try:
+            # Validate no output conflicts with currently active trees
+            try:
+                self.tree_validator.validate_tree(tree)
+                self.tree_validator.register_tree(tree)
+            except OutputConflictError as e:
+                logger.error(f"Cannot execute tree due to output conflict:\n{e}")
+                raise
+
             log_with_fields(
                 logger, logging.INFO, "Starting tree execution",
                 job_id=root_job.id,
@@ -726,6 +800,17 @@ class Coordinator:
 
         # Validate data registry references
         self.validate_data_registry_references()
+
+        # Validate tree output configurations (static conflicts)
+        logger.info("Validating tree output configurations...")
+        try:
+            self.tree_validator.validate_tree_configurations(self.trees)
+            logger.info("✓ No tree output conflicts detected")
+        except OutputConflictError as e:
+            logger.error("=" * 70)
+            logger.error(str(e))
+            logger.error("=" * 70)
+            raise
 
         # Initialize Minio
         self.initialize_minio()
