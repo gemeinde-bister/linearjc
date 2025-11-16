@@ -2,6 +2,28 @@
 
 This directory contains example job configurations for LinearJC.
 
+## Data Registry Path Types
+
+LinearJC requires explicit declaration of whether a registry entry is a file or directory:
+
+**path_type: file**
+- Single file expected
+- Archive must contain exactly one file
+- Extraction validates and moves file to registry path
+- Example: `/tmp/data/report.csv`
+
+**path_type: directory**
+- Directory with contents (single or multiple files)
+- Archive extracted to registry path
+- Preserves full directory structure
+- Example: `/tmp/data/website_build/`
+
+**Validation:**
+After extraction, LinearJC validates the result matches the declared type. If a job creates multiple files but the registry declares `path_type: file`, extraction will fail with a clear error message.
+
+**Design Philosophy:**
+Following mainframe JCL principles - explicitly declare what you're creating (like `DSORG=PS` vs `DSORG=PO`), and the system validates it matches. No guessing from file extensions or runtime inspection.
+
 ## Example Jobs
 
 ### hello.world.yaml

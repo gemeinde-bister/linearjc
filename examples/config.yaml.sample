@@ -1,34 +1,3 @@
-# LinearJC Coordinator Configuration (example)
-#
-# Copy to /etc/linearjc/config.yaml or another location and adjust for your environment.
-# Replace secrets and enable TLS in production.
-
-coordinator:
-  mqtt:
-    broker: localhost
-    port: 1883
-    keepalive: 60
-
-  minio:
-    endpoint: localhost:9000
-    access_key: minioadmin
-    secret_key: minioadmin
-    secure: false
-    temp_bucket: linearjc-temp
-
-  jobs_dir: /etc/linearjc/jobs
-  data_registry: /etc/linearjc/data_registry.yaml
-
-  scheduling:
-    loop_interval: 10
-    message_max_age: 60
-
-  signing:
-    shared_secret: "dev-secret-change-in-production"
-
-  logging:
-    level: INFO
-    file: /var/log/linearjc/coordinator.log
 # LinearJC Coordinator Configuration (Sample)
 #
 # IMPORTANT: This is a sample configuration with placeholders.
