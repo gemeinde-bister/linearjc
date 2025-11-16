@@ -121,6 +121,10 @@ python src/coordinator/main.py --config /etc/linearjc/config.yaml
 Notes
 - Example configs include development defaults (`minioadmin`, a sample shared secret). Replace before production and enable TLS.
 
+## Documentation
+
+- [Job Design Guide](docs/job-design-guide.md) - How to write job scripts and definitions
+
 ## Configuration
 
 Coordinator configuration (`examples/config.yaml`) defines:
