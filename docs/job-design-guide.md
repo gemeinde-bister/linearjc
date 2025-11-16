@@ -57,13 +57,28 @@ Available in all job scripts:
 
 ### 4. Output Structure
 
-Create subdirectories matching your job definition:
+Create subdirectories matching your job definition output names:
 
+**For directory outputs (path_type: directory):**
+```bash
+# Job YAML defines: outputs: { website: website_build }
+# Registry defines: path_type: directory
+mkdir -p "$LINEARJC_OUTPUT_DIR/website"
+echo "<html>..." > "$LINEARJC_OUTPUT_DIR/website/index.html"
+echo "body { }" > "$LINEARJC_OUTPUT_DIR/website/style.css"
+# Multiple files allowed
+```
+
+**For single file outputs (path_type: file):**
 ```bash
 # Job YAML defines: outputs: { report: daily_report }
+# Registry defines: path_type: file
 mkdir -p "$LINEARJC_OUTPUT_DIR/report"
-echo "data" > "$LINEARJC_OUTPUT_DIR/report/summary.txt"
+echo "Date,Value" > "$LINEARJC_OUTPUT_DIR/report/report.csv"
+# Only ONE file in the directory - validated at extraction
 ```
+
+**Important:** The output subdirectory name must match the key in your job's `outputs:` section. The registry's `path_type` determines whether one or many files are allowed.
 
 ## Job Definition (Coordinator)
 
@@ -99,23 +114,67 @@ job:
 
 ### Write-Once, Read-Many
 
-The data registry (`data_registry.yaml`) defines named data locations:
+The data registry (`data_registry.yaml`) defines named data locations with explicit type declarations:
 
+**Compact YAML format (recommended):**
 ```yaml
-raw_sensor_data:
-  type: filesystem
-  path: /data/sensors/live
+registry:
+  # Single file inputs/outputs
+  sensor_config: {type: filesystem, path_type: file, path: /data/sensors/config.json, readable: true, writable: false}
+  daily_report: {type: filesystem, path_type: file, path: /data/reports/daily.csv, readable: true, writable: true}
 
-backup_storage:
-  type: filesystem
-  path: /data/backups/daily
+  # Directory outputs (multiple files)
+  raw_sensor_data: {type: filesystem, path_type: directory, path: /data/sensors/live, readable: true, writable: false}
+  backup_storage: {type: filesystem, path_type: directory, path: /data/backups/daily, readable: true, writable: true}
+
+  # MinIO storage
+  intermediate_data: {type: minio, bucket: job-artifacts, prefix: temp/, retention_days: 7}
 ```
+
+**Path Types (required for filesystem entries):**
+
+- **`path_type: file`** - Single file
+  - Archive must contain exactly one file
+  - Validated at extraction time
+  - Example: CSV reports, JSON configs, single log files
+
+- **`path_type: directory`** - Directory with contents
+  - Archive can contain multiple files
+  - Preserves directory structure
+  - Example: Website builds, multi-file datasets, log directories
+
+**Design Philosophy:**
+Following mainframe JCL principles - explicitly declare what you're creating (like `DSORG=PS` vs `DSORG=PO`), and LinearJC validates it matches. No guessing from file extensions or runtime inspection.
 
 **Rules:**
 1. Each location has exactly ONE writer job
 2. Multiple jobs can read from the same location
 3. Jobs declare inputs/outputs by registry name, not filesystem paths
 4. Coordinator validates no two jobs write to the same location
+5. **Path type must match what job produces** (enforced at runtime)
+
+### Validation Errors
+
+LinearJC validates outputs match their declared `path_type`:
+
+**Error: Multiple files when file expected**
+```
+ArchiveError: Archive contains 3 items but path_type='file' requires exactly one file.
+Items: ['data.txt', 'summary.txt', 'log.txt']
+```
+**Solution:** Change registry to `path_type: directory` or modify job to create single file.
+
+**Error: Directory when file expected**
+```
+ArchiveError: Archive contains directory 'results' but path_type='file' requires a file
+```
+**Solution:** Job created subdirectory - flatten output or change to `path_type: directory`.
+
+**Error: Empty archive**
+```
+ArchiveError: Archive is empty but path_type='file' requires one file
+```
+**Solution:** Job script didn't create output - fix job logic.
 
 ### Locking (Advanced)
 
@@ -234,6 +293,11 @@ exit 0
 3. **Idempotent**: Jobs should produce same output given same input
 4. **Logging**: Write to stdout/stderr (captured in executor logs)
 5. **Cleanup**: Remove temp files on failure (or rely on executor cleanup)
+6. **Choose correct path_type**:
+   - Use `file` for single-file outputs (CSVs, JSON, single logs)
+   - Use `directory` for multi-file outputs (websites, datasets, archives)
+   - Declare explicitly - don't rely on naming conventions
+7. **Registry as contract**: Treat data registry as the contract between jobs - if you change path_type, dependent jobs may break
 
 ## When NOT to Use LinearJC
 
