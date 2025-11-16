@@ -176,6 +176,69 @@ fn validate_path_component(component: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate job script: must be executable and have valid shebang
+/// This replaces the hardcoded bash execution with standard Unix shebang behavior
+fn validate_job_script(path: &Path) -> Result<()> {
+    // Check file exists
+    if !path.exists() {
+        anyhow::bail!("Script does not exist: {}", path.display());
+    }
+
+    // Check it's a regular file (not directory/symlink)
+    let metadata = fs::metadata(path)
+        .context(format!("Failed to read metadata for {}", path.display()))?;
+
+    if !metadata.is_file() {
+        anyhow::bail!("Script is not a regular file: {}", path.display());
+    }
+
+    // Check execute permission (owner, group, or other)
+    #[cfg(unix)]
+    {
+        let permissions = metadata.permissions();
+        let mode = permissions.mode();
+        let is_executable = (mode & 0o111) != 0;  // Check any execute bit
+
+        if !is_executable {
+            anyhow::bail!(
+                "Script is not executable: {} (run: chmod +x {})",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+
+    // Validate shebang line (first line must start with #!)
+    let file = File::open(path)
+        .context(format!("Failed to open script: {}", path.display()))?;
+
+    use std::io::{BufRead, BufReader};
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+
+    reader.read_line(&mut first_line)
+        .context(format!("Failed to read first line of {}", path.display()))?;
+
+    if !first_line.starts_with("#!") {
+        anyhow::bail!(
+            "Script missing shebang line: {} (first line must start with #! followed by interpreter path)",
+            path.display()
+        );
+    }
+
+    // Extract interpreter path from shebang (trim #! and whitespace)
+    let interpreter = first_line[2..].trim();
+
+    if interpreter.is_empty() {
+        anyhow::bail!(
+            "Invalid shebang in {}: no interpreter specified",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Validate URL scheme - only allow HTTP/HTTPS
 fn validate_url(url: &str) -> Result<()> {
     // Basic length check
@@ -452,6 +515,7 @@ fn execute_job(
     executor_id: &str,
     client: &mut Client,
     shared_secret: &str,
+    allowed_extensions: &[String],
 ) -> Result<()> {
     use std::time::Instant;
 
@@ -520,8 +584,34 @@ fn execute_job(
     publish_progress(client, executor_id, tree_exec, job_exec, "ready",
                     "Inputs downloaded, starting job", shared_secret);
 
-    // Run job script as specified user (fork + setuid for privilege separation)
-    let script = jobs_dir.join(format!("{}.sh", req.job_id));
+    // Find job script by trying allowed extensions in order
+    // SECURITY: Extensions are admin-controlled via SCRIPT_EXTENSIONS config
+    // SECURITY: Duplicates prevented at discovery, so this is deterministic
+    let mut script = None;
+    for ext in allowed_extensions {
+        let candidate = jobs_dir.join(format!("{}.{}", &req.job_id, ext));
+        if candidate.exists() {
+            // SECURITY: Validate script before using (defense in depth)
+            if let Err(e) = validate_job_script(&candidate) {
+                warn!(
+                    "Found script {} but validation failed: {}",
+                    candidate.display(),
+                    e
+                );
+                continue;
+            }
+            script = Some(candidate);
+            break;
+        }
+    }
+
+    let script = script.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No valid script found for job_id '{}' with allowed extensions: {}",
+            req.job_id,
+            allowed_extensions.join(", ")
+        )
+    })?;
 
     publish_progress(client, executor_id, tree_exec, job_exec, "running",
                     "Job script executing", shared_secret);
@@ -573,8 +663,9 @@ fn execute_job(
                 std::process::exit(1);
             }
 
-            let status = Command::new("bash")
-                .arg(&script)
+            // Execute script directly - OS uses shebang to determine interpreter
+            // SECURITY: Script validated for executable + shebang at line 591
+            let status = Command::new(&script)
                 .env("LINEARJC_JOB_ID", &req.job_id)
                 .env("LINEARJC_EXECUTION_ID", &req.job_execution_id)
                 .env("LINEARJC_INPUT_DIR", &input_dir)
@@ -669,10 +760,21 @@ fn publish_progress(
 // Scans jobs directory at runtime to discover available jobs
 // ============================================================================
 
-/// Discover job capabilities by scanning the jobs directory for .sh files
-/// SECURITY: Only job scripts passing validation are advertised
-fn discover_capabilities(jobs_dir: &Path) -> Result<Vec<serde_json::Value>> {
+/// Discover job capabilities by scanning the jobs directory for executable scripts
+/// SECURITY: Only job scripts passing validation (executable + shebang) are advertised
+///
+/// Script naming convention: {job_id}.{extension}
+/// - job_id: Logical identifier (e.g., "hello.world")
+/// - extension: Must be in allowed_extensions list (e.g., "sh", "py", "pl")
+///
+/// Scripts must:
+/// 1. Be executable (chmod +x)
+/// 2. Have a valid shebang line (#!/path/to/interpreter)
+/// 3. Have an allowed extension
+/// 4. Be unique (no duplicate job_ids with different extensions)
+fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Result<Vec<serde_json::Value>> {
     let mut capabilities = Vec::new();
+    let mut seen_job_ids = HashMap::new();
 
     // Ensure jobs_dir exists
     if !jobs_dir.exists() {
@@ -683,39 +785,84 @@ fn discover_capabilities(jobs_dir: &Path) -> Result<Vec<serde_json::Value>> {
         return Ok(capabilities);
     }
 
-    // Scan for .sh files
+    // Scan for files with allowed extensions
     for entry in fs::read_dir(jobs_dir)
         .context(format!("Failed to read jobs directory: {}", jobs_dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
 
-        // Only process .sh files
-        if path.extension().and_then(|s| s.to_str()) != Some("sh") {
+        // Skip directories
+        if !path.is_file() {
             continue;
         }
 
-        // Extract job_id from filename (without .sh extension)
-        if let Some(job_id) = path.file_stem().and_then(|s| s.to_str()) {
-            // SECURITY: Validate job_id before advertising
-            if let Err(e) = validate_path_component(job_id) {
-                warn!(
-                    "Skipping invalid job script {}: {}",
-                    path.display(),
-                    e
-                );
+        // Check if file has an allowed extension
+        let extension = match path.extension().and_then(|s| s.to_str()) {
+            Some(ext) => ext,
+            None => {
+                debug!("Skipping file without extension: {}", path.display());
                 continue;
             }
+        };
 
-            // TODO: Could read version from job script header comment
-            // For now, default to 1.0.0
-            capabilities.push(serde_json::json!({
-                "job_id": job_id,
-                "version": "1.0.0"
-            }));
-
-            info!("Discovered job capability: {}", job_id);
+        if !allowed_extensions.iter().any(|e| e == extension) {
+            debug!(
+                "Skipping file with disallowed extension '{}': {}",
+                extension,
+                path.display()
+            );
+            continue;
         }
+
+        // Extract job_id from filename (without extension)
+        let job_id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(name) => name,
+            None => {
+                warn!("Skipping file with invalid UTF-8 name: {}", path.display());
+                continue;
+            }
+        };
+
+        // SECURITY: Validate job_id before advertising
+        if let Err(e) = validate_path_component(job_id) {
+            debug!(
+                "Skipping file {}: invalid job_id format: {}",
+                path.display(),
+                e
+            );
+            continue;
+        }
+
+        // Validate script is executable and has shebang
+        if let Err(e) = validate_job_script(&path) {
+            warn!(
+                "Skipping invalid job script {}: {}",
+                path.display(),
+                e
+            );
+            continue;
+        }
+
+        // SECURITY CRITICAL: Check for duplicate job_ids (different extensions)
+        if let Some(existing_path) = seen_job_ids.get(job_id) {
+            anyhow::bail!(
+                "Duplicate job_id '{}' found:\n  - {}\n  - {}\nOnly one script per job_id is allowed",
+                job_id,
+                existing_path,
+                path.display()
+            );
+        }
+        seen_job_ids.insert(job_id.to_string(), path.display().to_string());
+
+        // TODO: Could read version from job script header comment
+        // For now, default to 1.0.0
+        capabilities.push(serde_json::json!({
+            "job_id": job_id,
+            "version": "1.0.0"
+        }));
+
+        info!("Discovered job capability: {} ({})", job_id, path.display());
     }
 
     info!(
@@ -727,7 +874,7 @@ fn discover_capabilities(jobs_dir: &Path) -> Result<Vec<serde_json::Value>> {
     Ok(capabilities)
 }
 
-fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf) -> Result<()> {
+fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_extensions: &[String]) -> Result<()> {
     let broker = env::var("MQTT_BROKER").unwrap_or_else(|_| "localhost".into());
     let port: u16 = env::var("MQTT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(1883);
     let shared_secret = env::var("MQTT_SHARED_SECRET")
@@ -771,7 +918,7 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf) -> Resul
                                     info!("Received capability query (request_id={})", request_id);
 
                                     // Discover capabilities dynamically from jobs directory
-                                    let capabilities = match discover_capabilities(jobs_dir) {
+                                    let capabilities = match discover_capabilities(jobs_dir, allowed_extensions) {
                                         Ok(caps) => caps,
                                         Err(e) => {
                                             error!("Failed to discover capabilities: {}", e);
@@ -830,6 +977,7 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf) -> Resul
                                             let work_dir_clone = work_dir.clone();
                                             let executor_id_clone = executor_id.to_string();
                                             let shared_secret_clone = shared_secret.clone();
+                                            let allowed_extensions_clone = allowed_extensions.to_vec();
                                             let mut client_clone = client.clone();
 
                                             std::thread::spawn(move || {
@@ -839,7 +987,7 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf) -> Resul
                                                 publish_progress(&mut client_clone, &executor_id_clone, &req.tree_execution_id,
                                                                &req.job_execution_id, "assigned", "Job received", &shared_secret_clone);
 
-                                                match execute_job(&req, &jobs_dir_clone, &work_dir_clone, &executor_id_clone, &mut client_clone, &shared_secret_clone) {
+                                                match execute_job(&req, &jobs_dir_clone, &work_dir_clone, &executor_id_clone, &mut client_clone, &shared_secret_clone, &allowed_extensions_clone) {
                                                     Ok(_) => {
                                                         let total_duration_ms = total_start.elapsed().as_millis();
                                                         publish_progress(&mut client_clone, &executor_id_clone, &req.tree_execution_id,
@@ -910,9 +1058,50 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| "/tmp/linearjc".into())
         .into();
 
+    // Parse allowed script extensions (comma-separated)
+    // SECURITY: Admin explicitly controls which interpreters are allowed
+    let allowed_extensions: Vec<String> = env::var("SCRIPT_EXTENSIONS")
+        .unwrap_or_else(|_| "sh".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if allowed_extensions.is_empty() {
+        anyhow::bail!("SCRIPT_EXTENSIONS must not be empty");
+    }
+
+    // SECURITY CRITICAL: Validate extension values to prevent directory traversal
+    // Extensions are used in path construction (jobs_dir.join(format!("{}.{}", job_id, ext)))
+    // Malicious extensions like "../sh" could escape jobs_dir
+    for ext in &allowed_extensions {
+        // Only allow lowercase alphanumeric (no dots, slashes, dashes, underscores)
+        // This prevents: "../", "./", absolute paths, and other path manipulation
+        if !ext.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+            anyhow::bail!(
+                "Invalid SCRIPT_EXTENSIONS value '{}': only lowercase letters and digits allowed (e.g., 'sh', 'py', 'pl')",
+                ext
+            );
+        }
+
+        // Limit extension length (reasonable file extensions are 2-4 chars)
+        if ext.len() > 10 {
+            anyhow::bail!(
+                "Extension '{}' too long ({} chars, max 10)",
+                ext,
+                ext.len()
+            );
+        }
+
+        if ext.is_empty() {
+            anyhow::bail!("Empty extension not allowed");
+        }
+    }
+
     info!("Executor ID: {}", executor_id);
     info!("Jobs directory: {}", jobs_dir.display());
     info!("Work directory: {}", work_dir.display());
+    info!("Allowed script extensions: {}", allowed_extensions.join(", "));
 
     // SECURITY CRITICAL: Setup work directory with secure permissions
     setup_secure_work_dir(&work_dir)
@@ -938,7 +1127,7 @@ fn main() -> Result<()> {
         let (mut test_client, _connection) = Client::new(mqttoptions, 10);
         let test_secret = env::var("MQTT_SHARED_SECRET").unwrap_or_else(|_| "test-secret".to_string());
 
-        match execute_job(&request, &jobs_dir, &work_dir, &executor_id, &mut test_client, &test_secret) {
+        match execute_job(&request, &jobs_dir, &work_dir, &executor_id, &mut test_client, &test_secret, &allowed_extensions) {
             Ok(_) => {
                 info!("tree_exec={} job_exec={} executor={} state=test_passed Test passed",
                       &request.tree_execution_id, &request.job_execution_id, &executor_id);
@@ -955,7 +1144,7 @@ fn main() -> Result<()> {
 
     // MQTT mode: listen for job requests
     info!("Starting MQTT listener...");
-    mqtt_loop(&executor_id, &jobs_dir, &work_dir)?;
+    mqtt_loop(&executor_id, &jobs_dir, &work_dir, &allowed_extensions)?;
 
     Ok(())
 }
