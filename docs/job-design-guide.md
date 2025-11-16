@@ -177,6 +177,56 @@ exit 0
 
 **Security note**: Container runs as root for file permissions. Isolation happens at container boundary (standard practice: GitHub Actions, GitLab CI, Jenkins).
 
+## Compiled Binaries (Go, Rust, C, COBOL)
+
+Compiled programs can be integrated via shell wrapper scripts:
+
+```bash
+#!/bin/sh
+# Wrapper for compiled binary
+
+# Example: Using a standard binary (could be custom Go/Rust/C program)
+cat "$LINEARJC_INPUT_DIR/data/input.txt" | \
+    tr '[:lower:]' '[:upper:]' | \
+    tee "$LINEARJC_OUTPUT_DIR/result/output.txt"
+
+# Validate output exists
+if [ ! -f "$LINEARJC_OUTPUT_DIR/result/output.txt" ]; then
+    echo "ERROR: Binary failed to create output"
+    exit 1
+fi
+
+exit 0
+```
+
+**Pattern for custom binaries:**
+
+```bash
+#!/bin/sh
+# Job runs pre-compiled program
+
+# Execute binary (reads LINEARJC_* environment variables)
+./my-program
+
+# Check exit code
+if [ $? -ne 0 ]; then
+    echo "ERROR: Program failed"
+    exit 1
+fi
+
+# Validate expected outputs
+[ -f "$LINEARJC_OUTPUT_DIR/result/data.out" ] || exit 1
+
+exit 0
+```
+
+**Why use wrappers:**
+- Validates inputs before execution
+- Checks outputs after execution
+- Handles errors explicitly
+- Maintains consistent shebang pattern
+- Provides logging context
+
 ## Best Practices
 
 1. **Validate outputs**: Always check expected files exist before `exit 0`
