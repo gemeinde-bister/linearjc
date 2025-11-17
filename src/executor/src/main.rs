@@ -890,12 +890,6 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_
 
     let (client, mut connection) = Client::new(mqttoptions, 10);
 
-    // Subscribe to capability queries and job requests
-    client.subscribe("linearjc/query/capabilities", QoS::AtLeastOnce)?;
-    client.subscribe("linearjc/jobs/requests/+", QoS::AtLeastOnce)?;
-    info!("Subscribed to capability queries and job requests");
-
-    // Get hostname for capability responses
     let hostname = env::var("HOSTNAME")
         .or_else(|_| env::var("HOST"))
         .unwrap_or_else(|_| "unknown".to_string());
