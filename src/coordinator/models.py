@@ -1,5 +1,7 @@
 """
 Data models for LinearJC coordinator.
+
+Format follows SPEC.md v0.5.0-draft (2025-11-25).
 """
 from typing import List, Dict, Optional
 from pydantic import BaseModel, Field, field_validator
@@ -22,21 +24,42 @@ class JobSchedule(BaseModel):
         return v
 
 
-class JobExecutor(BaseModel):
-    """Executor configuration for a job."""
+class ResourceLimits(BaseModel):
+    """Resource limits for job execution (cgroups v2)."""
+    cpu_percent: Optional[int] = Field(None, ge=1, le=100, description="CPU limit as % of one core")
+    memory_mb: Optional[int] = Field(None, ge=1, description="Memory limit in MB")
+    processes: Optional[int] = Field(None, ge=1, description="Max number of processes")
+
+
+class JobRun(BaseModel):
+    """Job execution configuration (run: section in job.yaml)."""
     user: str = Field(description="Unix user to run job as")
     timeout: int = Field(default=3600, ge=1, description="Timeout in seconds")
+    entry: str = Field(default="script.sh", description="Entry script filename")
+    binaries: List[str] = Field(default_factory=list, description="Bundled binary paths")
+    isolation: str = Field(default="none", description="Isolation mode: strict | relaxed | none")
+    network: bool = Field(default=True, description="Allow network access")
+    extra_read_paths: List[str] = Field(default_factory=list, description="Extra read paths for relaxed mode")
+    limits: Optional[ResourceLimits] = Field(None, description="Resource limits (cgroups v2)")
+
+    @field_validator('isolation')
+    @classmethod
+    def validate_isolation_mode(cls, v: str) -> str:
+        """Validate isolation mode."""
+        if v not in ["strict", "relaxed", "none"]:
+            raise ValueError(f"Invalid isolation mode: {v}. Must be strict, relaxed, or none")
+        return v
 
 
 class Job(BaseModel):
-    """Job definition."""
+    """Job definition (SPEC.md v0.5.0 format)."""
     id: str = Field(description="Unique job identifier")
     version: str = Field(description="Job version (semver)")
-    depends_on: List[str] = Field(default_factory=list, description="List of job IDs this depends on")
+    reads: List[str] = Field(default_factory=list, description="Input register names")
+    writes: List[str] = Field(default_factory=list, description="Output register names (job owns these)")
+    depends: List[str] = Field(default_factory=list, description="Job IDs that must complete first")
     schedule: JobSchedule
-    executor: JobExecutor
-    inputs: Dict[str, str] = Field(default_factory=dict, description="Input name -> registry key")
-    outputs: Dict[str, str] = Field(default_factory=dict, description="Output name -> registry key")
+    run: JobRun
 
     # Metadata (not in YAML, added during loading)
     file_path: Optional[Path] = Field(default=None, exclude=True, description="Source file path")
@@ -48,22 +71,19 @@ class Job(BaseModel):
         from coordinator.security_utils import validate_job_id
         return validate_job_id(v)
 
-    @field_validator('depends_on')
+    @field_validator('depends')
     @classmethod
-    def validate_depends_on(cls, v: List[str]) -> List[str]:
+    def validate_depends(cls, v: List[str]) -> List[str]:
         """Validate dependency job IDs."""
         from coordinator.security_utils import validate_job_id
         return [validate_job_id(dep_id) for dep_id in v]
 
-    @field_validator('inputs', 'outputs')
+    @field_validator('reads', 'writes')
     @classmethod
-    def validate_registry_refs(cls, v: Dict[str, str]) -> Dict[str, str]:
+    def validate_registry_refs(cls, v: List[str]) -> List[str]:
         """Validate registry key references."""
         from coordinator.security_utils import validate_registry_key
-        # Validate registry keys (values)
-        for name, key in v.items():
-            validate_registry_key(key)
-        return v
+        return [validate_registry_key(key) for key in v]
 
     def __hash__(self):
         """Make Job hashable for use in sets/dicts."""
@@ -82,28 +102,21 @@ class JobFile(BaseModel):
 
 
 class DataRegistryEntry(BaseModel):
-    """Entry in the data registry."""
-    type: str = Field(description="Storage type: filesystem or minio")
+    """Entry in the data registry (SPEC.md v0.5.0 format)."""
+    type: str = Field(description="Storage type: fs or minio")
     # Filesystem fields
     path: Optional[str] = None
-    path_type: Optional[str] = Field(
-        default=None,
-        description="Path type for filesystem: 'file' or 'directory'"
-    )
-    readable: Optional[bool] = True
-    writable: Optional[bool] = True
-    # Minio fields
+    kind: Optional[str] = Field(default=None, description="Path kind: file or dir")
+    # MinIO fields
     bucket: Optional[str] = None
     prefix: Optional[str] = None
-    retention_days: Optional[int] = None
-    # Note: All transfers use tar.gz automatically - no configuration needed
 
     @field_validator('type')
     @classmethod
     def validate_type(cls, v: str) -> str:
         """Validate storage type."""
-        if v not in ['filesystem', 'minio']:
-            raise ValueError(f"Invalid type: {v}. Must be 'filesystem' or 'minio'")
+        if v not in ['fs', 'minio']:
+            raise ValueError(f"Invalid type: {v}. Must be 'fs' or 'minio'")
         return v
 
     @field_validator('path')
@@ -113,12 +126,7 @@ class DataRegistryEntry(BaseModel):
         if v is None:
             return v
 
-        # Basic validation - detailed validation happens at runtime
-        # when we know the allowed roots from configuration
         from coordinator.security_utils import validate_path
-
-        # Just do basic safety checks here (no shell chars, etc)
-        # Full path validation with allowed_roots happens in Coordinator.load_data_registry()
         try:
             validate_path(v, allowed_roots=None, allow_relative=False, description="registry path")
         except Exception as e:
@@ -126,21 +134,20 @@ class DataRegistryEntry(BaseModel):
 
         return v
 
-    @field_validator('path_type')
+    @field_validator('kind')
     @classmethod
-    def validate_path_type(cls, v: Optional[str], info) -> Optional[str]:
-        """Validate path_type field."""
+    def validate_kind(cls, v: Optional[str], info) -> Optional[str]:
+        """Validate kind field."""
         if v is None:
             return v
 
-        # path_type only valid for filesystem type
+        # kind only valid for fs type
         entry_type = info.data.get('type')
-        if entry_type != 'filesystem':
-            raise ValueError(f"path_type only valid for filesystem type, not {entry_type}")
+        if entry_type != 'fs':
+            raise ValueError(f"kind only valid for fs type, not {entry_type}")
 
-        # Must be 'file' or 'directory'
-        if v not in ['file', 'directory']:
-            raise ValueError(f"path_type must be 'file' or 'directory', got: {v}")
+        if v not in ['file', 'dir']:
+            raise ValueError(f"kind must be 'file' or 'dir', got: {v}")
 
         return v
 

@@ -3,17 +3,22 @@ Archive handling for LinearJC coordinator.
 
 All transfers use tar.gz format automatically:
 - Archives contain directory contents, not the directory itself
-- Preserves permissions, timestamps, symlinks
+- Preserves permissions, timestamps (permissions not restored for security)
+- SYMLINKS ARE BLOCKED for security
 - Works with both directories and single files
 - Simple, predictable, auditable
 
-Security: Uses Python's tarfile module to prevent command injection.
+Security: Uses Python's tarfile module with strict validation:
+- Blocks symlinks to prevent directory escape attacks
+- Validates paths to prevent traversal attacks (CVE-2007-4559)
+- Extracts members individually to avoid TOCTOU races
 """
 import logging
 import shutil
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,52 @@ logger = logging.getLogger(__name__)
 class ArchiveError(Exception):
     """Error during archive operations."""
     pass
+
+
+def safe_extract_member(
+    tar: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    dest_dir: Path
+) -> None:
+    """
+    Securely extract a single tar member with validation.
+
+    Blocks symlinks, validates paths, prevents path traversal.
+
+    Args:
+        tar: Open TarFile object
+        member: Member to extract
+        dest_dir: Destination directory (must be resolved)
+
+    Raises:
+        ArchiveError: If member is unsafe (symlink, path traversal, etc.)
+    """
+    # SECURITY: Block symlinks to prevent directory escape attacks
+    if member.issym() or member.islnk():
+        raise ArchiveError(
+            f"Archive contains symlink: {member.name} "
+            f"(symlinks are not allowed for security)"
+        )
+
+    # SECURITY: Block absolute paths
+    if member.name.startswith('/') or member.name.startswith('\\'):
+        raise ArchiveError(
+            f"Archive contains absolute path: {member.name} "
+            f"(only relative paths allowed)"
+        )
+
+    # SECURITY: Check for path traversal
+    member_path = (dest_dir / member.name).resolve()
+    try:
+        member_path.relative_to(dest_dir)
+    except ValueError:
+        raise ArchiveError(
+            f"Archive contains unsafe path: {member.name} "
+            f"(attempts to escape destination directory)"
+        )
+
+    # Extract safely without setting attributes (ownership, permissions)
+    tar.extract(member, dest_dir, set_attrs=False)
 
 
 def create_archive(source_path: str, archive_path: str) -> None:
@@ -86,12 +137,13 @@ def extract_archive(archive_path: str, dest_path: str, path_type: str = 'directo
     if not archive.exists():
         raise ArchiveError(f"Archive does not exist: {archive_path}")
 
-    if path_type == 'directory':
+    # SPEC.md v0.5.0: Accept both short form (dir/file) and long form (directory/file)
+    if path_type in ('directory', 'dir'):
         _extract_to_directory(archive_path, dest_path)
     elif path_type == 'file':
         _extract_to_file(archive_path, dest_path)
     else:
-        raise ArchiveError(f"Invalid path_type: {path_type}. Must be 'file' or 'directory'")
+        raise ArchiveError(f"Invalid path_type: {path_type}. Must be 'file', 'dir', or 'directory'")
 
 
 def _extract_to_directory(archive_path: str, dest_path: str) -> None:
@@ -103,20 +155,9 @@ def _extract_to_directory(archive_path: str, dest_path: str) -> None:
 
     try:
         with tarfile.open(archive_path, 'r:gz') as tar:
-            # Security: Check for path traversal in archive members
+            # Security: Validate and extract members safely
             for member in tar.getmembers():
-                member_path = Path(dest_dir) / member.name
-                # Resolve to absolute path and check it's within dest_dir
-                try:
-                    member_path.resolve().relative_to(dest_dir.resolve())
-                except ValueError:
-                    raise ArchiveError(
-                        f"Archive contains unsafe path: {member.name} "
-                        f"(attempts to escape destination directory)"
-                    )
-
-            # Extract all members (safe after validation)
-            tar.extractall(dest_dir)
+                safe_extract_member(tar, member, dest_dir)
 
         logger.info(f"Extracted archive to directory: {archive_path} -> {dest_path}")
 
@@ -141,17 +182,9 @@ def _extract_to_file(archive_path: str, dest_path: str) -> None:
     try:
         # Extract to temporary directory
         with tarfile.open(archive_path, 'r:gz') as tar:
-            # Security: Check for path traversal
+            # Security: Validate and extract members safely
             for member in tar.getmembers():
-                member_path = Path(temp_dir) / member.name
-                try:
-                    member_path.resolve().relative_to(temp_dir.resolve())
-                except ValueError:
-                    raise ArchiveError(
-                        f"Archive contains unsafe path: {member.name}"
-                    )
-
-            tar.extractall(temp_dir)
+                safe_extract_member(tar, member, temp_dir)
 
         # Find extracted files
         extracted = list(temp_dir.iterdir())

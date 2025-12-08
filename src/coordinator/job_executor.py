@@ -133,23 +133,21 @@ class JobExecutor:
         prepared_inputs = {}
 
         try:
-            for input_name, registry_key in root_job.inputs.items():
+            for registry_key in root_job.reads:
                 if registry_key not in self.data_registry:
                     raise JobExecutorError(
-                        f"Input '{input_name}' references unknown registry key: "
-                        f"{registry_key}"
+                        f"Input references unknown registry key: {registry_key}"
                     )
 
                 registry_entry = self.data_registry[registry_key]
 
                 logger.debug(
-                    f"Preparing input '{input_name}' from registry '{registry_key}' "
-                    f"(type: {registry_entry.type})"
+                    f"Preparing input '{registry_key}' (type: {registry_entry.type})"
                 )
 
-                if registry_entry.type == "filesystem":
-                    prepared_inputs[input_name] = self._prepare_filesystem_input(
-                        input_name,
+                if registry_entry.type == "fs":
+                    prepared_inputs[registry_key] = self._prepare_filesystem_input(
+                        registry_key,
                         registry_entry,
                         tree_execution_id,
                         execution_dir,
@@ -157,8 +155,8 @@ class JobExecutor:
                     )
 
                 elif registry_entry.type == "minio":
-                    prepared_inputs[input_name] = self._prepare_minio_input(
-                        input_name,
+                    prepared_inputs[registry_key] = self._prepare_minio_input(
+                        registry_key,
                         registry_entry,
                         root_job
                     )
@@ -270,7 +268,7 @@ class JobExecutor:
         )
 
         # Generate pre-signed GET URL
-        expires_seconds = job.executor.timeout + 3600  # timeout + 1 hour
+        expires_seconds = job.run.timeout + 3600  # timeout + 1 hour
         url = self.minio.generate_presigned_get_url(
             self.temp_bucket,
             minio_object_name,
@@ -280,7 +278,8 @@ class JobExecutor:
         return {
             "url": url,
             "method": "GET",
-            "format": self.archive_format
+            "format": self.archive_format,
+            "kind": registry_entry.kind  # Phase 7: executor needs this for extraction
         }
 
     def _prepare_minio_input(
@@ -305,7 +304,7 @@ class JobExecutor:
         object_name = registry_entry.prefix
 
         # Generate pre-signed GET URL
-        expires_seconds = job.executor.timeout + 3600
+        expires_seconds = job.run.timeout + 3600
         url = self.minio.generate_presigned_get_url(
             bucket,
             object_name,
@@ -315,8 +314,161 @@ class JobExecutor:
         return {
             "url": url,
             "method": "GET",
-            "format": self.archive_format
+            "format": self.archive_format,
+            "kind": registry_entry.kind  # Phase 7: executor needs this for extraction
         }
+
+    def prepare_chain_job_inputs(
+        self,
+        job: Job,
+        prev_job: Job,
+        tree: JobTree,
+        tree_execution_id: str
+    ) -> Dict[str, Dict[str, str]]:
+        """
+        Prepare inputs for a non-root job in a chain.
+
+        Inputs can come from:
+        1. Previous job's outputs (intermediate data in MinIO)
+        2. External sources (filesystem or MinIO registry entries)
+
+        Args:
+            job: Current job to prepare inputs for
+            prev_job: Previous job in chain (for intermediate data)
+            tree: Job tree containing the chain
+            tree_execution_id: Execution ID
+
+        Returns:
+            Dict mapping input_name -> {url, method, format, kind}
+
+        Raises:
+            JobExecutorError: If preparation fails
+        """
+        logger.info(
+            f"Preparing chain inputs for {job.id} "
+            f"(previous: {prev_job.id}, execution: {tree_execution_id})"
+        )
+
+        prepared_inputs = {}
+
+        try:
+            for registry_key in job.reads:
+                if registry_key not in self.data_registry:
+                    raise JobExecutorError(
+                        f"Input references unknown registry key: {registry_key}"
+                    )
+
+                registry_entry = self.data_registry[registry_key]
+
+                # Check if this input comes from the previous job's outputs
+                if registry_key in prev_job.writes:
+                    # Intermediate data: read from MinIO (previous job's output)
+                    logger.debug(
+                        f"Input '{registry_key}' from previous job {prev_job.id} (intermediate)"
+                    )
+                    prepared_inputs[registry_key] = self._prepare_intermediate_input(
+                        registry_key,
+                        registry_entry,
+                        tree_execution_id,
+                        job
+                    )
+                else:
+                    # External input: use normal preparation
+                    logger.debug(
+                        f"Input '{registry_key}' from external source (type: {registry_entry.type})"
+                    )
+                    if registry_entry.type == "fs":
+                        # Need execution_dir for filesystem inputs
+                        execution_dir = self._get_or_create_execution_dir(tree_execution_id)
+                        prepared_inputs[registry_key] = self._prepare_filesystem_input(
+                            registry_key,
+                            registry_entry,
+                            tree_execution_id,
+                            execution_dir,
+                            job
+                        )
+                    elif registry_entry.type == "minio":
+                        prepared_inputs[registry_key] = self._prepare_minio_input(
+                            registry_key,
+                            registry_entry,
+                            job
+                        )
+                    else:
+                        raise JobExecutorError(
+                            f"Unsupported registry type: {registry_entry.type}"
+                        )
+
+            logger.info(
+                f"Prepared {len(prepared_inputs)} chain inputs for {job.id}"
+            )
+
+            return prepared_inputs
+
+        except Exception as e:
+            logger.error(f"Failed to prepare chain inputs: {e}")
+            raise JobExecutorError(f"Chain input preparation failed: {e}")
+
+    def _prepare_intermediate_input(
+        self,
+        registry_key: str,
+        registry_entry: DataRegistryEntry,
+        tree_execution_id: str,
+        job: Job
+    ) -> Dict[str, str]:
+        """
+        Prepare input from previous job's output (intermediate data in MinIO).
+
+        Args:
+            registry_key: Registry key (same as output name from previous job)
+            registry_entry: Registry entry for kind information
+            tree_execution_id: Execution ID
+            job: Current job (for timeout calculation)
+
+        Returns:
+            Dict with url, method, format, kind
+        """
+        # Previous job uploaded to: jobs/{tree_exec_id}/output_{registry_key}.{format}
+        archive_filename = f"output_{registry_key}.{self.archive_format}"
+        minio_object_name = f"jobs/{tree_execution_id}/{archive_filename}"
+
+        # Generate pre-signed GET URL
+        expires_seconds = job.run.timeout + 3600
+        url = self.minio.generate_presigned_get_url(
+            self.temp_bucket,
+            minio_object_name,
+            expires_seconds
+        )
+
+        return {
+            "url": url,
+            "method": "GET",
+            "format": self.archive_format,
+            "kind": registry_entry.kind
+        }
+
+    def _get_or_create_execution_dir(self, tree_execution_id: str) -> Path:
+        """
+        Get or create execution directory for a tree execution.
+
+        Args:
+            tree_execution_id: Execution ID
+
+        Returns:
+            Path to execution directory
+        """
+        # Look for existing directory (created by root job)
+        for item in self.work_dir.iterdir():
+            if item.is_dir() and item.name.startswith(f"{tree_execution_id}-"):
+                return item
+
+        # Create new directory if not found (shouldn't happen in normal flow)
+        import tempfile
+        execution_dir = Path(tempfile.mkdtemp(
+            prefix=f"{tree_execution_id}-",
+            dir=self.work_dir
+        ))
+        os.chmod(execution_dir, 0o700)
+        return execution_dir
 
     def prepare_job_outputs(
         self,
@@ -343,31 +495,31 @@ class JobExecutor:
         prepared_outputs = {}
 
         try:
-            for output_name, registry_key in job.outputs.items():
+            for registry_key in job.writes:
                 if registry_key not in self.data_registry:
                     raise JobExecutorError(
-                        f"Output '{output_name}' references unknown registry key: "
-                        f"{registry_key}"
+                        f"Output references unknown registry key: {registry_key}"
                     )
 
                 registry_entry = self.data_registry[registry_key]
 
                 # Generate Minio object name for output (format from config)
-                archive_filename = f"output_{output_name}.{self.archive_format}"
+                archive_filename = f"output_{registry_key}.{self.archive_format}"
                 minio_object_name = f"jobs/{tree_execution_id}/{archive_filename}"
 
                 # Generate pre-signed PUT URL
-                expires_seconds = job.executor.timeout + 3600
+                expires_seconds = job.run.timeout + 3600
                 url = self.minio.generate_presigned_put_url(
                     self.temp_bucket,
                     minio_object_name,
                     expires_seconds
                 )
 
-                prepared_outputs[output_name] = {
+                prepared_outputs[registry_key] = {
                     "url": url,
                     "method": "PUT",
-                    "format": self.archive_format
+                    "format": self.archive_format,
+                    "kind": registry_entry.kind  # Phase 7: executor needs this for archiving
                 }
 
             logger.debug(f"Prepared {len(prepared_outputs)} output URLs")
@@ -406,23 +558,21 @@ class JobExecutor:
         )
 
         try:
-            for output_name, registry_key in leaf_job.outputs.items():
+            for registry_key in leaf_job.writes:
                 if registry_key not in self.data_registry:
                     raise JobExecutorError(
-                        f"Output '{output_name}' references unknown registry key: "
-                        f"{registry_key}"
+                        f"Output references unknown registry key: {registry_key}"
                     )
 
                 registry_entry = self.data_registry[registry_key]
 
                 logger.debug(
-                    f"Collecting output '{output_name}' to registry '{registry_key}' "
-                    f"(type: {registry_entry.type})"
+                    f"Collecting output '{registry_key}' (type: {registry_entry.type})"
                 )
 
-                if registry_entry.type == "filesystem":
+                if registry_entry.type == "fs":
                     self._collect_filesystem_output(
-                        output_name,
+                        registry_key,
                         registry_entry,
                         tree_execution_id,
                         execution_dir
@@ -431,12 +581,12 @@ class JobExecutor:
                 elif registry_entry.type == "minio":
                     # Already in Minio, nothing to do
                     logger.debug(
-                        f"Output '{output_name}' is minio type, "
+                        f"Output '{registry_key}' is minio type, "
                         f"already in bucket {registry_entry.bucket}"
                     )
 
             logger.info(
-                f"Collected {len(leaf_job.outputs)} outputs from {leaf_job.id}"
+                f"Collected {len(leaf_job.writes)} outputs from {leaf_job.id}"
             )
 
         except Exception as e:
@@ -445,7 +595,7 @@ class JobExecutor:
 
     def _collect_filesystem_output(
         self,
-        output_name: str,
+        registry_key: str,
         registry_entry: DataRegistryEntry,
         tree_execution_id: str,
         execution_dir: Path
@@ -457,8 +607,8 @@ class JobExecutor:
         write to the same destination.
 
         Args:
-            output_name: Logical output name
-            registry_entry: Registry entry with filesystem path and path_type
+            registry_key: Registry key (used as output name)
+            registry_entry: Registry entry with filesystem path and kind
             tree_execution_id: Execution ID
             execution_dir: Working directory
 
@@ -466,10 +616,10 @@ class JobExecutor:
             JobExecutorError: If extraction or validation fails
         """
         dest_path = registry_entry.path
-        path_type = registry_entry.path_type or 'directory'  # Default for backward compatibility
+        kind = registry_entry.kind or 'dir'  # Default for backward compatibility
 
         # Download archive from Minio (format from config)
-        archive_filename = f"output_{output_name}.{self.archive_format}"
+        archive_filename = f"output_{registry_key}.{self.archive_format}"
         archive_path = execution_dir / archive_filename
         minio_object_name = f"jobs/{tree_execution_id}/{archive_filename}"
 
@@ -485,25 +635,25 @@ class JobExecutor:
         logger.debug(f"Acquiring lock for filesystem path: {dest_path}")
         with self.output_lock_manager.acquire(dest_path):
             logger.debug(
-                f"Extracting {self.archive_format} archive as {path_type}: "
+                f"Extracting {self.archive_format} archive as {kind}: "
                 f"{archive_path} -> {dest_path}"
             )
-            extract_archive(str(archive_path), dest_path, path_type=path_type)
+            extract_archive(str(archive_path), dest_path, path_type=kind)
 
-            # Validate extraction result matches declared path_type
+            # Validate extraction result matches declared kind
             dest = Path(dest_path)
-            if path_type == 'file' and not dest.is_file():
+            if kind == 'file' and not dest.is_file():
                 raise JobExecutorError(
                     f"Expected file at {dest_path} but found "
                     f"{'directory' if dest.is_dir() else 'nothing'}"
                 )
-            elif path_type == 'directory' and not dest.is_dir():
+            elif kind == 'dir' and not dest.is_dir():
                 raise JobExecutorError(
                     f"Expected directory at {dest_path} but found "
                     f"{'file' if dest.is_file() else 'nothing'}"
                 )
 
-        logger.info(f"Collected output '{output_name}' to {dest_path} ({path_type})")
+        logger.info(f"Collected output '{registry_key}' to {dest_path} ({kind})")
 
     def build_job_request(
         self,
@@ -528,6 +678,33 @@ class JobExecutor:
         """
         timestamp = datetime.utcnow().isoformat() + 'Z'
 
+        # Build run configuration (SPEC.md v0.5.0 format)
+        run_config = {
+            "user": job.run.user,
+            "timeout": job.run.timeout,
+            "entry": job.run.entry,
+            "isolation": job.run.isolation,
+            "network": job.run.network,
+            "extra_read_paths": job.run.extra_read_paths
+        }
+
+        # Add binaries if present
+        if job.run.binaries:
+            run_config["binaries"] = job.run.binaries
+
+        # Add resource limits if present (Phase 7)
+        if job.run.limits:
+            limits = {}
+            if job.run.limits.cpu_percent is not None:
+                limits["cpu_percent"] = job.run.limits.cpu_percent
+            if job.run.limits.memory_mb is not None:
+                limits["memory_mb"] = job.run.limits.memory_mb
+            if job.run.limits.processes is not None:
+                limits["processes"] = job.run.limits.processes
+
+            if limits:  # Only add if there are actual limits
+                run_config["limits"] = limits
+
         request = {
             # Correlation IDs for tracing
             "tree_execution_id": tree_execution_id,
@@ -537,10 +714,7 @@ class JobExecutor:
             "job_version": job.version,
             "inputs": inputs,
             "outputs": outputs,
-            "executor": {
-                "user": job.executor.user,
-                "timeout": job.executor.timeout
-            },
+            "run": run_config,
             "callback": f"linearjc/jobs/progress/{job_execution_id}",
             "timestamp": timestamp
             # Note: signature will be added later by MQTT client

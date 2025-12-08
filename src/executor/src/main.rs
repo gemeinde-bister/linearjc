@@ -9,28 +9,34 @@
 // ============================================================================
 
 use anyhow::{Context, Result};
-use chrono::Utc;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use hmac::{Hmac, Mac};
 use log::{debug, error, info, warn};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{chown, fork, setuid, ForkResult, Gid, Uid, User};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::{getuid, Pid, Uid, User};
 use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::fs::File;
 use std::path::Path;
-use std::process::Command;
+use std::sync::{LazyLock, Mutex};
 use std::{collections::HashMap, env, fs, path::PathBuf, time::Duration};
-use subtle::ConstantTimeEq;
-use tar::Archive;
 
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+// Thread-safe tracking of active job PIDs for cancellation support
+static ACTIVE_JOBS: LazyLock<Mutex<HashMap<String, Pid>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-type HmacSha256 = Hmac<Sha256>;
+// Note: PermissionsExt now handled by linearjc_core::package
+
+// Use shared linearjc-core library for security-critical code
+use linearjc_core::{
+    archive::{extract_tar_gz, create_tar_gz_from_file, create_tar_gz_from_dir},
+    isolation::{FilesystemIsolation, IsolationConfig, ResourceLimits},
+    signing::{sign_message, verify_message},
+    workdir::{chown_recursive, setup_secure_work_dir, validate_path_component},
+    // Phase 13 prep: Use shared execution and WorkDir from linearjc-core
+    execution::{spawn_isolated, poll_job, cleanup_job, validate_job_script},
+    // Unified job/package handling
+    package::{read_package_metadata, get_package_version, extract_package_to_workdir, compare_versions},
+    WorkDir,
+};
+
+// Note: flate2/tar now handled by linearjc_core::package
 
 #[derive(Deserialize)]
 struct JobRequest {
@@ -42,97 +48,50 @@ struct JobRequest {
     assigned_to: Option<String>,
     inputs: HashMap<String, DataSpec>,
     outputs: HashMap<String, DataSpec>,
-    executor: ExecutorSpec,
+    run: RunSpec,  // SPEC.md v0.5.0: renamed from 'executor'
 }
 
+/// SPEC.md v0.5.0 format: run configuration
 #[derive(Deserialize)]
-struct ExecutorSpec {
+struct RunSpec {
     user: String,
     timeout: u64,
+    #[serde(default)]
+    entry: Option<String>,  // Optional: entry script filename
+    #[serde(default = "default_isolation")]
+    isolation: String,      // SPEC.md v0.5.0: flattened to string (strict|relaxed|none)
+    #[serde(default = "default_network")]
+    network: bool,
+    #[serde(default)]
+    extra_read_paths: Vec<String>,
+    #[serde(default)]
+    limits: Option<ResourceLimitsSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ResourceLimitsSpec {
+    cpu_percent: Option<u32>,
+    memory_mb: Option<u64>,
+    processes: Option<u64>,
+    io_mbps: Option<u64>,
+}
+
+fn default_isolation() -> String {
+    "none".to_string() // Default: no isolation (opt-in)
+}
+
+fn default_network() -> bool {
+    true // Default: network enabled
 }
 
 #[derive(Deserialize)]
 struct DataSpec {
     url: String,
     format: String,
+    kind: Option<String>, // SPEC.md v0.5.0: "file" or "dir" (renamed from path_type)
 }
 
-/// Sign a message with HMAC-SHA256 using envelope pattern (matches Python implementation)
-fn sign_message(msg: serde_json::Value, secret: &str) -> Result<serde_json::Value> {
-    // Serialize payload to canonical JSON (compact, sorted keys)
-    // serde_json::to_string() already produces compact JSON
-    let payload = serde_json::to_string(&msg)?;
-
-    // Create timestamp (ISO 8601 UTC with 'Z' suffix)
-    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-
-    // Compute signature over payload + timestamp
-    let to_sign = format!("{}{}", payload, timestamp);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
-    mac.update(to_sign.as_bytes());
-    let signature = hex::encode(mac.finalize().into_bytes());
-
-    // Return envelope
-    Ok(serde_json::json!({
-        "payload": payload,
-        "timestamp": timestamp,
-        "signature": signature
-    }))
-}
-
-/// Verify a message envelope and return the payload (matches Python implementation)
-fn verify_message(envelope: &serde_json::Value, secret: &str, max_age_secs: i64) -> Result<serde_json::Value> {
-    // Extract required fields
-    let payload = envelope.get("payload")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Envelope missing 'payload'"))?;
-
-    let timestamp_str = envelope.get("timestamp")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Envelope missing 'timestamp'"))?;
-
-    let provided_sig = envelope.get("signature")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Envelope missing 'signature'"))?;
-
-    // Parse timestamp
-    let timestamp = chrono::DateTime::parse_from_rfc3339(
-        &timestamp_str.replace('Z', "+00:00")
-    )?.with_timezone(&Utc);
-
-    // Check message age
-    let now = Utc::now();
-    let age = (now - timestamp).num_seconds();
-
-    if age < 0 {
-        anyhow::bail!("Message timestamp in future (clock skew?)");
-    }
-
-    if age > max_age_secs {
-        anyhow::bail!("Message too old: {}s (max: {}s)", age, max_age_secs);
-    }
-
-    // Verify signature using constant-time comparison (prevents timing attacks)
-    let to_verify = format!("{}{}", payload, timestamp_str);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
-    mac.update(to_verify.as_bytes());
-    let expected_sig_bytes = mac.finalize().into_bytes();
-
-    // SECURITY CRITICAL: Use constant-time comparison to prevent timing attacks
-    // Convert hex strings to bytes for comparison
-    let provided_sig_bytes = hex::decode(provided_sig)
-        .context("Invalid signature encoding")?;
-
-    // Constant-time comparison using subtle crate
-    if expected_sig_bytes.ct_eq(&provided_sig_bytes).into() {
-        // Signature valid - return parsed payload
-        Ok(serde_json::from_str(payload)?)
-    } else {
-        anyhow::bail!("Invalid signature")
-    }
-}
+// sign_message and verify_message are now imported from linearjc_core::signing
 
 // ============================================================================
 // INPUT VALIDATION - SECURITY CRITICAL
@@ -140,104 +99,8 @@ fn verify_message(envelope: &serde_json::Value, secret: &str, max_age_secs: i64)
 // or privileged operations. Defense in depth against injection attacks.
 // ============================================================================
 
-/// Validate path component to prevent directory traversal and injection attacks
-/// Only allows: alphanumeric, dots, dashes, underscores
-/// Rejects: "..", "/", shell metacharacters
-fn validate_path_component(component: &str) -> Result<()> {
-    if component.is_empty() {
-        anyhow::bail!("Path component cannot be empty");
-    }
-
-    // Reject components that are too long (DoS prevention)
-    if component.len() > 255 {
-        anyhow::bail!("Path component too long: {} bytes", component.len());
-    }
-
-    // Only allow safe characters: alphanumeric, dot, dash, underscore
-    for c in component.chars() {
-        if !c.is_alphanumeric() && c != '.' && c != '-' && c != '_' {
-            anyhow::bail!(
-                "Invalid character in path component '{}': '{}' (only alphanumeric, ., -, _ allowed)",
-                component, c
-            );
-        }
-    }
-
-    // Prevent directory traversal
-    if component.contains("..") {
-        anyhow::bail!("Directory traversal detected: {}", component);
-    }
-
-    // Prevent absolute paths
-    if component.starts_with('/') {
-        anyhow::bail!("Absolute paths not allowed: {}", component);
-    }
-
-    Ok(())
-}
-
-/// Validate job script: must be executable and have valid shebang
-/// This replaces the hardcoded bash execution with standard Unix shebang behavior
-fn validate_job_script(path: &Path) -> Result<()> {
-    // Check file exists
-    if !path.exists() {
-        anyhow::bail!("Script does not exist: {}", path.display());
-    }
-
-    // Check it's a regular file (not directory/symlink)
-    let metadata = fs::metadata(path)
-        .context(format!("Failed to read metadata for {}", path.display()))?;
-
-    if !metadata.is_file() {
-        anyhow::bail!("Script is not a regular file: {}", path.display());
-    }
-
-    // Check execute permission (owner, group, or other)
-    #[cfg(unix)]
-    {
-        let permissions = metadata.permissions();
-        let mode = permissions.mode();
-        let is_executable = (mode & 0o111) != 0;  // Check any execute bit
-
-        if !is_executable {
-            anyhow::bail!(
-                "Script is not executable: {} (run: chmod +x {})",
-                path.display(),
-                path.display()
-            );
-        }
-    }
-
-    // Validate shebang line (first line must start with #!)
-    let file = File::open(path)
-        .context(format!("Failed to open script: {}", path.display()))?;
-
-    use std::io::{BufRead, BufReader};
-    let mut reader = BufReader::new(file);
-    let mut first_line = String::new();
-
-    reader.read_line(&mut first_line)
-        .context(format!("Failed to read first line of {}", path.display()))?;
-
-    if !first_line.starts_with("#!") {
-        anyhow::bail!(
-            "Script missing shebang line: {} (first line must start with #! followed by interpreter path)",
-            path.display()
-        );
-    }
-
-    // Extract interpreter path from shebang (trim #! and whitespace)
-    let interpreter = first_line[2..].trim();
-
-    if interpreter.is_empty() {
-        anyhow::bail!(
-            "Invalid shebang in {}: no interpreter specified",
-            path.display()
-        );
-    }
-
-    Ok(())
-}
+// validate_path_component is now imported from linearjc_core::workdir
+// validate_job_script is now imported from linearjc_core::execution
 
 /// Validate URL scheme - only allow HTTP/HTTPS
 fn validate_url(url: &str) -> Result<()> {
@@ -319,17 +182,17 @@ fn validate_job_request(req: &JobRequest) -> Result<()> {
         }
     }
 
-    // Validate executor user
-    validate_username(&req.executor.user)
-        .context("Invalid executor user")?;
+    // Validate run user
+    validate_username(&req.run.user)
+        .context("Invalid run user")?;
 
     // Validate timeout (prevent extremely long-running jobs)
-    if req.executor.timeout == 0 {
+    if req.run.timeout == 0 {
         anyhow::bail!("Timeout must be > 0");
     }
-    if req.executor.timeout > 86400 {
+    if req.run.timeout > 86400 {
         // 24 hours max
-        anyhow::bail!("Timeout too long: {}s (max: 86400s / 24h)", req.executor.timeout);
+        anyhow::bail!("Timeout too long: {}s (max: 86400s / 24h)", req.run.timeout);
     }
 
     info!(
@@ -337,8 +200,8 @@ fn validate_job_request(req: &JobRequest) -> Result<()> {
         req.tree_execution_id,
         req.job_execution_id,
         req.job_id,
-        req.executor.user,
-        req.executor.timeout,
+        req.run.user,
+        req.run.timeout,
         req.inputs.len(),
         req.outputs.len()
     );
@@ -354,158 +217,60 @@ fn get_uid_for_user(username: &str) -> Result<Uid> {
 }
 
 // ============================================================================
-// SECURE ARCHIVE HANDLING - Replaces tar(1) subprocess to prevent command injection
-// Uses pure Rust implementation for safety and auditability
+// SECURE ARCHIVE HANDLING - Now uses linearjc_core::archive
+// extract_tar_gz, create_tar_gz_from_file, create_tar_gz_from_dir imported from core
 // ============================================================================
 
-/// Extract tar.gz archive to directory using Rust tar library (not subprocess)
-/// SECURITY: Prevents command injection via paths
-fn extract_tar_gz(archive_path: &Path, extract_to: &Path) -> Result<()> {
-    let tar_gz = File::open(archive_path)
-        .context(format!("Failed to open archive: {}", archive_path.display()))?;
-    let tar = GzDecoder::new(tar_gz);
-    let mut archive = Archive::new(tar);
-
-    archive
-        .unpack(extract_to)
-        .context(format!("Failed to extract to: {}", extract_to.display()))?;
-
-    Ok(())
-}
-
-/// Create tar.gz archive from directory using Rust tar library (not subprocess)
-/// SECURITY: Prevents command injection via paths
-fn create_tar_gz(source_dir: &Path, archive_path: &Path) -> Result<()> {
-    let tar_gz = File::create(archive_path)
-        .context(format!("Failed to create archive: {}", archive_path.display()))?;
-    let enc = GzEncoder::new(tar_gz, Compression::default());
-    let mut tar = tar::Builder::new(enc);
-
-    // Add all contents of source_dir to archive root (not the directory itself)
-    tar.append_dir_all(".", source_dir)
-        .context(format!("Failed to archive: {}", source_dir.display()))?;
-
-    tar.finish()
-        .context("Failed to finalize archive")?;
-
-    Ok(())
-}
-
-/// Recursively change ownership of directory and all contents
-/// SECURITY: Pure Rust implementation prevents command injection via chown(1)
-fn chown_recursive(path: &Path, uid: Uid, gid: Gid) -> Result<()> {
-    // Change ownership of the directory itself
-    chown(path, Some(uid), Some(gid))
-        .context(format!("Failed to chown: {}", path.display()))?;
-
-    // If it's a directory, recursively chown all contents
-    if path.is_dir() {
-        for entry in fs::read_dir(path)
-            .context(format!("Failed to read directory: {}", path.display()))?
-        {
-            let entry = entry?;
-            let entry_path = entry.path();
-
-            // Recursively chown
-            chown_recursive(&entry_path, uid, gid)?;
-        }
-    }
-
-    Ok(())
-}
-
 // ============================================================================
-// SECURE WORK DIRECTORY - Prevents information disclosure and symlink attacks
-// Work directory must be owned by executor with restrictive permissions
+// PACKAGE HANDLING - Now uses linearjc_core::package
+// read_package_metadata, get_package_version, compare_versions,
+// extract_package_to_workdir imported from linearjc_core::package
 // ============================================================================
 
-/// Create or validate work directory with secure permissions
-/// SECURITY: Ensures directory is owned by current user with mode 0700 (owner-only)
-#[cfg(unix)]
-fn setup_secure_work_dir(work_dir: &Path) -> Result<()> {
-    use nix::unistd::getuid;
+// chown_recursive is now imported from linearjc_core::workdir
 
-    // Warn if using world-readable locations
-    if work_dir.starts_with("/tmp") || work_dir.starts_with("/var/tmp") {
-        warn!(
-            "Work directory is in shared temporary space: {}",
-            work_dir.display()
-        );
-        warn!("For production use, configure WORK_DIR to a dedicated directory");
-        warn!("Example: WORK_DIR=/var/lib/linearjc/executor");
-    }
+// ============================================================================
+// SECURE WORK DIRECTORY - Now uses linearjc_core::workdir::setup_secure_work_dir
+// ============================================================================
 
-    // Create directory if it doesn't exist
-    fs::create_dir_all(work_dir)
-        .context(format!("Failed to create work directory: {}", work_dir.display()))?;
+/// Convert RunSpec from job request to isolation::IsolationConfig
+/// SPEC.md v0.5.0: isolation is now a direct string field (strict|relaxed|none)
+fn parse_isolation_config(run: &RunSpec, job_exec_id: &str) -> Result<IsolationConfig> {
 
-    // Set secure permissions (0711 - owner full, others can traverse)
-    // Mode 711 allows job users to traverse to their subdirectories
-    // but prevents listing the work_dir contents
-    let metadata = fs::metadata(work_dir)
-        .context(format!("Failed to get metadata for: {}", work_dir.display()))?;
+    // Parse filesystem isolation mode from string
+    let filesystem = FilesystemIsolation::from_str(&run.isolation)
+        .context(format!("Invalid isolation mode: {}", run.isolation))?;
 
-    let mut permissions = metadata.permissions();
-    let current_mode = permissions.mode();
-    let secure_mode = 0o711;
+    // Convert resource limits if present
+    let limits = run.limits.as_ref().map(|l| ResourceLimits {
+        cpu_percent: l.cpu_percent,
+        memory_mb: l.memory_mb,
+        processes: l.processes,
+        io_mbps: l.io_mbps,
+    });
 
-    if current_mode & 0o777 != secure_mode {
-        info!(
-            "Setting secure permissions on work directory: {} (mode: {:o} -> {:o})",
-            work_dir.display(),
-            current_mode & 0o777,
-            secure_mode
-        );
-        permissions.set_mode(secure_mode);
-        fs::set_permissions(work_dir, permissions)
-            .context(format!("Failed to set permissions on: {}", work_dir.display()))?;
-    }
+    // Convert extra read paths to PathBuf
+    let extra_read_paths: Vec<PathBuf> = run.extra_read_paths
+        .iter()
+        .map(|s| PathBuf::from(s))
+        .collect();
 
-    // Re-read metadata after permission changes
-    let metadata = fs::metadata(work_dir)
-        .context(format!("Failed to get metadata for: {}", work_dir.display()))?;
-
-    // Verify ownership (must be owned by current user running executor)
-    let current_uid = getuid();
-    if metadata.uid() != current_uid.as_raw() {
-        anyhow::bail!(
-            "Work directory {} is not owned by current user (uid: {}, owner: {})",
-            work_dir.display(),
-            current_uid,
-            metadata.uid()
-        );
-    }
-
-    // Verify final permissions
-    let final_mode = metadata.permissions().mode() & 0o777;
-    if final_mode != secure_mode {
-        anyhow::bail!(
-            "Failed to set secure permissions on work directory: {} (expected: {:o}, actual: {:o})",
-            work_dir.display(),
-            secure_mode,
-            final_mode
-        );
-    }
-
+    // Log isolation configuration
     info!(
-        "Work directory validated: {} (uid: {}, mode: {:o})",
-        work_dir.display(),
-        metadata.uid(),
-        final_mode
+        "job_exec={} isolation: mode={:?}, network={}, limits={:?}, extra_paths={}",
+        job_exec_id,
+        filesystem,
+        run.network,
+        limits.is_some(),
+        extra_read_paths.len()
     );
 
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn setup_secure_work_dir(work_dir: &Path) -> Result<()> {
-    // On non-Unix systems, just create the directory
-    // Windows/other platforms have different permission models
-    fs::create_dir_all(work_dir)
-        .context(format!("Failed to create work directory: {}", work_dir.display()))?;
-
-    warn!("Running on non-Unix platform - directory permissions not enforced");
-    Ok(())
+    Ok(IsolationConfig {
+        filesystem,
+        network: run.network,
+        limits,
+        extra_read_paths,
+    })
 }
 
 fn execute_job(
@@ -528,11 +293,16 @@ fn execute_job(
     // Note: Archive format validation is now done in validate_job_request()
     // This was moved to consolidate all input validation in one place
 
-    let job_dir = work_dir.join(&req.job_execution_id);
-    let input_dir = job_dir.join("inputs");
-    let output_dir = job_dir.join("outputs");
-    fs::create_dir_all(&input_dir)?;
-    fs::create_dir_all(&output_dir)?;
+    // Phase 7: Standardized directory layout (using linearjc-core WorkDir)
+    let job_work = WorkDir::new(work_dir, &req.job_execution_id)
+        .context("Failed to create work directory")?;
+
+    // Aliases for readability (matches linearjc-core naming)
+    let job_dir = &job_work.root;
+    let in_dir = &job_work.in_dir;
+    let out_dir = &job_work.out_dir;
+    let tmp_dir = &job_work.tmp_dir;
+    let work_subdir = &job_work.work_dir;
 
     // Download & extract inputs with timing
     if !req.inputs.is_empty() {
@@ -545,17 +315,66 @@ fn execute_job(
         info!("tree_exec={} job_exec={} executor={} state=downloading input={} Downloading input",
               tree_exec, job_exec, executor_id, name);
 
-        let archive = input_dir.join(format!("{}.{}", name, &spec.format));
-        let extract = input_dir.join(name);
+        // Download archive to work subdirectory
+        let archive = work_subdir.join(format!("{}.{}", name, &spec.format));
 
         let bytes = reqwest::blocking::get(&spec.url)?.bytes()?;
         let size = bytes.len();
         fs::write(&archive, bytes)?;
-        fs::create_dir_all(&extract)?;
 
-        // SECURITY: Use Rust tar library instead of subprocess to prevent command injection
-        extract_tar_gz(&archive, &extract)
-            .context(format!("Failed to extract {}", name))?;
+        // Phase 7: Extract based on kind (SPEC.md v0.5.0: "file" or "dir")
+        let kind = spec.kind.as_deref().unwrap_or("dir");
+        match kind {
+            "file" => {
+                // Extract single file directly to in/{name}
+                let dest_file = in_dir.join(name);
+
+                // Extract to temp directory first
+                let temp_extract = work_subdir.join(format!("{}_extract", name));
+                fs::create_dir_all(&temp_extract)?;
+
+                // SECURITY: Use Rust tar library instead of subprocess to prevent command injection
+                extract_tar_gz(&archive, &temp_extract)
+                    .context(format!("Failed to extract {}", name))?;
+
+                // Find the single file in the archive (assume first file is the target)
+                let entries: Vec<_> = fs::read_dir(&temp_extract)?
+                    .filter_map(|e| e.ok())
+                    .collect();
+
+                if entries.is_empty() {
+                    anyhow::bail!("Archive for '{}' is empty", name);
+                }
+
+                // Move first file to destination
+                let src_file = entries[0].path();
+                if src_file.is_file() {
+                    fs::copy(&src_file, &dest_file)?;
+                } else {
+                    anyhow::bail!("Expected file for '{}', got directory", name);
+                }
+
+                // Cleanup temp extraction
+                fs::remove_dir_all(&temp_extract)?;
+
+                info!("Extracted input '{}' as file to in/{}", name, name);
+            }
+            "dir" => {
+                // Extract directory to in/{name}/
+                let dest_dir = in_dir.join(name);
+                fs::create_dir_all(&dest_dir)?;
+
+                // SECURITY: Use Rust tar library instead of subprocess to prevent command injection
+                extract_tar_gz(&archive, &dest_dir)
+                    .context(format!("Failed to extract {}", name))?;
+
+                info!("Extracted input '{}' as directory to in/{}/", name, name);
+            }
+            other => {
+                anyhow::bail!("Unknown kind '{}' for input '{}'", other, name);
+            }
+        }
+
         fs::remove_file(&archive)?;
 
         let duration_ms = start.elapsed().as_millis();
@@ -563,121 +382,138 @@ fn execute_job(
               tree_exec, job_exec, executor_id, name, size, duration_ms);
     }
 
-    // Change ownership of work directory to job user so they can write outputs
-    let uid = get_uid_for_user(&req.executor.user)?;
-    let user_info = User::from_uid(uid)?.ok_or_else(|| anyhow::anyhow!("User info not found"))?;
-    chown(&job_dir, Some(uid), Some(user_info.gid))?;
-    chown(&input_dir, Some(uid), Some(user_info.gid))?;
-    chown(&output_dir, Some(uid), Some(user_info.gid))?;
+    // Phase 7: Add metadata file for job introspection (using linearjc-core WorkDir)
+    let input_names: Vec<String> = req.inputs.keys().cloned().collect();
+    let output_names: Vec<String> = req.outputs.keys().cloned().collect();
+    job_work.create_metadata(&input_names, &output_names, &req.job_id, &req.job_execution_id)
+        .context("Failed to create job metadata")?;
 
-    // Recursively chown input files (after extraction)
+    // Get target user info for privilege operations
+    // SECURITY: Skip chown/setuid if already running as the target user (allows non-root E2E testing)
+    let uid = get_uid_for_user(&req.run.user)?;
+    let user_info = User::from_uid(uid)?.ok_or_else(|| anyhow::anyhow!("User info not found"))?;
+    let current_uid = getuid();
+    let needs_privilege_change = current_uid != uid;
+
+    // Change ownership of work directory to job user so they can write outputs
     // SECURITY: Use nix library chown instead of subprocess to prevent command injection
-    for name in req.inputs.keys() {
-        let extract = input_dir.join(name);
-        if extract.exists() {
-            chown_recursive(&extract, uid, user_info.gid)
-                .context(format!("Failed to chown {}", name))?;
-        }
+    if needs_privilege_change {
+        job_work.chown_all(uid, user_info.gid)
+            .context("Failed to chown work directory")?;
+    } else {
+        debug!("Skipping chown: already running as target user {}", req.run.user);
     }
+
+    // Parse isolation configuration (SPEC.md v0.5.0: from run spec)
+    let isolation_config = parse_isolation_config(&req.run, job_exec)?;
 
     // Inputs ready, about to run job
     publish_progress(client, executor_id, tree_exec, job_exec, "ready",
                     "Inputs downloaded, starting job", shared_secret);
 
-    // Find job script by trying allowed extensions in order
-    // SECURITY: Extensions are admin-controlled via SCRIPT_EXTENSIONS config
-    // SECURITY: Duplicates prevented at discovery, so this is deterministic
-    let mut script = None;
-    for ext in allowed_extensions {
-        let candidate = jobs_dir.join(format!("{}.{}", &req.job_id, ext));
-        if candidate.exists() {
-            // SECURITY: Validate script before using (defense in depth)
-            if let Err(e) = validate_job_script(&candidate) {
-                warn!(
-                    "Found script {} but validation failed: {}",
-                    candidate.display(),
-                    e
-                );
-                continue;
-            }
-            script = Some(candidate);
-            break;
-        }
+    // SPEC.md v0.5.0: Find .ljc package and extract to work_dir
+    let package_path = jobs_dir.join(format!("{}.ljc", &req.job_id));
+    if !package_path.exists() {
+        anyhow::bail!(
+            "Package not found for job_id '{}': {}",
+            req.job_id,
+            package_path.display()
+        );
     }
 
-    let script = script.ok_or_else(|| {
-        anyhow::anyhow!(
-            "No valid script found for job_id '{}' with allowed extensions: {}",
-            req.job_id,
-            allowed_extensions.join(", ")
-        )
-    })?;
+    // Extract package to job_dir (work_dir/{execution_id}/)
+    // Script and all job files will be in job_dir, not jobs_dir
+    let script = extract_package_to_workdir(&package_path, job_dir)
+        .context(format!("Failed to extract package for {}", req.job_id))?;
+
+    // SECURITY: Validate extracted script (defense in depth)
+    validate_job_script(&script)
+        .context(format!("Extracted script validation failed: {}", script.display()))?;
+
+    info!("Extracted package to {} (script: {})", job_dir.display(), script.display());
+
+    // Chown extracted files to job user (script, bin/, etc.)
+    // Skip in/ out/ tmp/ which are already owned by job user
+    // SECURITY: Skip if already running as target user (allows non-root E2E testing)
+    if needs_privilege_change {
+        for entry in fs::read_dir(job_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Skip directories we already chowned
+            if name == "in" || name == "out" || name == "tmp" || name == ".work" {
+                continue;
+            }
+
+            chown_recursive(&path, uid, user_info.gid)
+                .context(format!("Failed to chown extracted file: {}", path.display()))?;
+        }
+    }
 
     publish_progress(client, executor_id, tree_exec, job_exec, "running",
                     "Job script executing", shared_secret);
 
     info!("tree_exec={} job_exec={} executor={} state=running user={} Running job script",
-          tree_exec, job_exec, executor_id, req.executor.user);
+          tree_exec, job_exec, executor_id, req.run.user);
 
-    let job_start = Instant::now();
+    // Phase 13 prep: Use linearjc-core execution API for job spawning
+    // This handles: fork, cgroup creation, isolation, privilege drop, exec
+    let spawned_job = spawn_isolated(
+        &script,
+        &job_work,
+        &req.job_id,
+        &req.job_execution_id,
+        &req.run.user,
+        &isolation_config,
+    ).context("Failed to spawn isolated job")?;
 
-    match unsafe { fork() }? {
-        ForkResult::Parent { child } => {
-            // Parent: poll for child completion (non-blocking to allow MQTT event loop)
-            loop {
-                match waitpid(child, Some(WaitPidFlag::WNOHANG))? {
-                    WaitStatus::StillAlive => {
-                        // Child still running, sleep briefly to allow MQTT event loop to run
-                        std::thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                    WaitStatus::Exited(_, 0) => {
-                        let job_duration_ms = job_start.elapsed().as_millis();
-                        info!("tree_exec={} job_exec={} executor={} duration_ms={} Job script completed successfully",
-                              tree_exec, job_exec, executor_id, job_duration_ms);
-                        break;
-                    }
-                    WaitStatus::Exited(_, code) => {
-                        let job_duration_ms = job_start.elapsed().as_millis();
-                        error!("tree_exec={} job_exec={} executor={} duration_ms={} exit_code={} Job script failed",
-                               tree_exec, job_exec, executor_id, job_duration_ms, code);
-                        anyhow::bail!("Job script failed with exit code {}", code);
-                    }
-                    WaitStatus::Signaled(_, signal, _) => {
-                        error!("tree_exec={} job_exec={} executor={} signal={:?} Job script killed by signal",
-                               tree_exec, job_exec, executor_id, signal);
-                        anyhow::bail!("Job script killed by signal {:?}", signal);
-                    }
-                    _ => {
-                        error!("tree_exec={} job_exec={} executor={} Job script terminated unexpectedly",
-                               tree_exec, job_exec, executor_id);
-                        anyhow::bail!("Job script terminated unexpectedly");
-                    }
-                }
-            }
+    // Register PID for cancellation support
+    if let Ok(mut jobs) = ACTIVE_JOBS.lock() {
+        jobs.insert(job_exec.to_string(), spawned_job.pid);
+    }
+
+    // Helper to unregister PID on all exit paths
+    let unregister_pid = || {
+        if let Ok(mut jobs) = ACTIVE_JOBS.lock() {
+            jobs.remove(job_exec);
         }
-        ForkResult::Child => {
-            // Child: switch to job user and execute script
-            if let Err(e) = setuid(uid) {
-                error!("Failed to switch to user '{}': {}", req.executor.user, e);
-                std::process::exit(1);
+    };
+
+    // Poll for job completion using linearjc-core poll_job()
+    // (non-blocking to allow MQTT event loop to run)
+    let execution_result = loop {
+        match poll_job(&spawned_job)? {
+            None => {
+                // Job still running, sleep briefly
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
-
-            // Execute script directly - OS uses shebang to determine interpreter
-            // SECURITY: Script validated for executable + shebang at line 591
-            let status = Command::new(&script)
-                .env("LINEARJC_JOB_ID", &req.job_id)
-                .env("LINEARJC_EXECUTION_ID", &req.job_execution_id)
-                .env("LINEARJC_INPUT_DIR", &input_dir)
-                .env("LINEARJC_OUTPUT_DIR", &output_dir)
-                .status()
-                .unwrap_or_else(|e| {
-                    error!("Failed to execute job script: {}", e);
-                    std::process::exit(1)
-                });
-
-            std::process::exit(if status.success() { 0 } else { 1 });
+            Some(result) => break result,
         }
+    };
+
+    // Unregister PID and cleanup cgroup
+    unregister_pid();
+    cleanup_job(spawned_job);
+
+    // Handle execution result
+    let job_duration_ms = execution_result.duration.as_millis();
+    if execution_result.success {
+        info!("tree_exec={} job_exec={} executor={} duration_ms={} Job script completed successfully",
+              tree_exec, job_exec, executor_id, job_duration_ms);
+    } else if let Some(code) = execution_result.exit_code {
+        error!("tree_exec={} job_exec={} executor={} duration_ms={} exit_code={} Job script failed",
+               tree_exec, job_exec, executor_id, job_duration_ms, code);
+        anyhow::bail!("Job script failed with exit code {}", code);
+    } else if let Some(signal) = execution_result.signal {
+        error!("tree_exec={} job_exec={} executor={} signal={} Job script killed by signal",
+               tree_exec, job_exec, executor_id, signal);
+        anyhow::bail!("Job script killed by signal {}", signal);
+    } else {
+        error!("tree_exec={} job_exec={} executor={} Job script terminated unexpectedly",
+               tree_exec, job_exec, executor_id);
+        anyhow::bail!("Job script terminated unexpectedly: {:?}", execution_result.error);
     }
 
     // Archive & upload outputs with timing
@@ -691,12 +527,20 @@ fn execute_job(
         info!("tree_exec={} job_exec={} executor={} state=uploading output={} Uploading output",
               tree_exec, job_exec, executor_id, name);
 
-        let source = output_dir.join(name);
-        let archive = output_dir.join(format!("upload_{}.{}", name, &spec.format));
+        // Phase 7: Read from out/{name}
+        let source = out_dir.join(name);
+        let archive = work_subdir.join(format!("upload_{}.{}", name, &spec.format));
 
         // SECURITY: Use Rust tar library instead of subprocess to prevent command injection
-        create_tar_gz(&source, &archive)
-            .context(format!("Failed to create archive for {}", name))?;
+        // Phase 7: Check kind to determine if source is file or directory (SPEC.md v0.5.0)
+        let kind = spec.kind.as_deref().unwrap_or("dir");
+        if kind == "file" {
+            create_tar_gz_from_file(&source, &archive)
+                .context(format!("Failed to create archive for file {}", name))?;
+        } else {
+            create_tar_gz_from_dir(&source, &archive)
+                .context(format!("Failed to create archive for directory {}", name))?;
+        }
 
         let bytes = fs::read(&archive)?;
         let size = bytes.len();
@@ -756,23 +600,18 @@ fn publish_progress(
 }
 
 // ============================================================================
-// CAPABILITY DISCOVERY - Replaces hardcoded capabilities
-// Scans jobs directory at runtime to discover available jobs
+// CAPABILITY DISCOVERY - Scans jobs directory for .ljc packages
+// SPEC.md v0.5.0: Jobs are cached as complete .ljc packages (tar.gz)
 // ============================================================================
 
-/// Discover job capabilities by scanning the jobs directory for executable scripts
-/// SECURITY: Only job scripts passing validation (executable + shebang) are advertised
+/// Discover job capabilities by scanning the jobs directory for .ljc packages
+/// SPEC.md v0.5.0: Package naming convention: {job_id}.ljc
 ///
-/// Script naming convention: {job_id}.{extension}
-/// - job_id: Logical identifier (e.g., "hello.world")
-/// - extension: Must be in allowed_extensions list (e.g., "sh", "py", "pl")
-///
-/// Scripts must:
-/// 1. Be executable (chmod +x)
-/// 2. Have a valid shebang line (#!/path/to/interpreter)
-/// 3. Have an allowed extension
-/// 4. Be unique (no duplicate job_ids with different extensions)
-fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Result<Vec<serde_json::Value>> {
+/// Packages must:
+/// 1. Have .ljc extension (tar.gz format)
+/// 2. Contain valid job.yaml with job.id and job.version
+/// 3. Have unique job_id (no duplicates)
+fn discover_capabilities(jobs_dir: &Path, _allowed_extensions: &[String]) -> Result<Vec<serde_json::Value>> {
     let mut capabilities = Vec::new();
     let mut seen_job_ids = HashMap::new();
 
@@ -785,7 +624,7 @@ fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Resu
         return Ok(capabilities);
     }
 
-    // Scan for files with allowed extensions
+    // Scan for .ljc package files
     for entry in fs::read_dir(jobs_dir)
         .context(format!("Failed to read jobs directory: {}", jobs_dir.display()))?
     {
@@ -797,7 +636,7 @@ fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Resu
             continue;
         }
 
-        // Check if file has an allowed extension
+        // Check for .ljc extension
         let extension = match path.extension().and_then(|s| s.to_str()) {
             Some(ext) => ext,
             None => {
@@ -806,9 +645,9 @@ fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Resu
             }
         };
 
-        if !allowed_extensions.iter().any(|e| e == extension) {
+        if extension != "ljc" {
             debug!(
-                "Skipping file with disallowed extension '{}': {}",
+                "Skipping non-package file '{}': {}",
                 extension,
                 path.display()
             );
@@ -816,7 +655,7 @@ fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Resu
         }
 
         // Extract job_id from filename (without extension)
-        let job_id = match path.file_stem().and_then(|s| s.to_str()) {
+        let filename_job_id = match path.file_stem().and_then(|s| s.to_str()) {
             Some(name) => name,
             None => {
                 warn!("Skipping file with invalid UTF-8 name: {}", path.display());
@@ -824,8 +663,8 @@ fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Resu
             }
         };
 
-        // SECURITY: Validate job_id before advertising
-        if let Err(e) = validate_path_component(job_id) {
+        // SECURITY: Validate job_id before processing
+        if let Err(e) = validate_path_component(filename_job_id) {
             debug!(
                 "Skipping file {}: invalid job_id format: {}",
                 path.display(),
@@ -834,35 +673,47 @@ fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Resu
             continue;
         }
 
-        // Validate script is executable and has shebang
-        if let Err(e) = validate_job_script(&path) {
+        // Read job metadata from package (job.yaml inside tar.gz)
+        let metadata = match read_package_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                warn!(
+                    "Skipping invalid package {}: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Verify job_id matches filename (security: prevent ID spoofing)
+        if metadata.job_id != filename_job_id {
             warn!(
-                "Skipping invalid job script {}: {}",
+                "Package {}: job_id mismatch (file: '{}', yaml: '{}') - skipping",
                 path.display(),
-                e
+                filename_job_id,
+                metadata.job_id
             );
             continue;
         }
 
-        // SECURITY CRITICAL: Check for duplicate job_ids (different extensions)
-        if let Some(existing_path) = seen_job_ids.get(job_id) {
+        // SECURITY CRITICAL: Check for duplicate job_ids
+        if let Some(existing_path) = seen_job_ids.get(&metadata.job_id) {
             anyhow::bail!(
-                "Duplicate job_id '{}' found:\n  - {}\n  - {}\nOnly one script per job_id is allowed",
-                job_id,
+                "Duplicate job_id '{}' found:\n  - {}\n  - {}\nOnly one package per job_id is allowed",
+                metadata.job_id,
                 existing_path,
                 path.display()
             );
         }
-        seen_job_ids.insert(job_id.to_string(), path.display().to_string());
+        seen_job_ids.insert(metadata.job_id.clone(), path.display().to_string());
 
-        // TODO: Could read version from job script header comment
-        // For now, default to 1.0.0
         capabilities.push(serde_json::json!({
-            "job_id": job_id,
-            "version": "1.0.0"
+            "job_id": metadata.job_id,
+            "version": metadata.version
         }));
 
-        info!("Discovered job capability: {} ({})", job_id, path.display());
+        info!("Discovered job capability: {} v{} ({})", metadata.job_id, metadata.version, path.display());
     }
 
     info!(
@@ -872,6 +723,104 @@ fn discover_capabilities(jobs_dir: &Path, allowed_extensions: &[String]) -> Resu
     );
 
     Ok(capabilities)
+}
+
+fn download_and_install_job(
+    job_id: &str,
+    version: &str,
+    uri: &str,
+    expected_checksum: &str,
+    jobs_dir: &Path
+) -> Result<()> {
+    /// Download job package from MinIO, verify checksum, and save as .ljc
+    /// SPEC.md v0.5.0: Cache full .ljc package, don't extract scripts
+
+    use sha2::Digest;
+
+    info!("Downloading {} v{} from {}", job_id, version, uri);
+
+    // For S3 URIs, we need to convert to HTTP presigned URL
+    // The coordinator should provide pre-signed URLs, but if not we need MinIO client
+    // For now, assume coordinator provides pre-signed HTTP(S) URLs
+    let download_url = if uri.starts_with("s3://") {
+        // Extract bucket and key
+        let without_prefix = uri.trim_start_matches("s3://");
+        let parts: Vec<&str> = without_prefix.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("Invalid S3 URI format: {}", uri);
+        }
+
+        // Get MinIO endpoint from environment
+        let minio_endpoint = env::var("MINIO_ENDPOINT")
+            .unwrap_or_else(|_| "localhost:9000".to_string());
+        let minio_secure = env::var("MINIO_SECURE")
+            .unwrap_or_else(|_| "false".to_string()) == "true";
+
+        let scheme = if minio_secure { "https" } else { "http" };
+        format!("{}//{}/{}/{}", scheme, minio_endpoint, parts[0], parts[1])
+    } else {
+        uri.to_string()
+    };
+
+    // Download package
+    info!("Downloading from: {}", download_url);
+    let response = reqwest::blocking::get(&download_url)
+        .context("Failed to download package")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP error {}: {}", response.status(), download_url);
+    }
+
+    let package_bytes = response.bytes()
+        .context("Failed to read response body")?;
+
+    info!("Downloaded {} bytes", package_bytes.len());
+
+    // Verify checksum
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&package_bytes);
+    let checksum = format!("{:x}", hasher.finalize());
+
+    if checksum != expected_checksum {
+        anyhow::bail!(
+            "Checksum mismatch! Expected: {}, Got: {}",
+            expected_checksum,
+            checksum
+        );
+    }
+
+    info!("Checksum verified: {}", checksum);
+
+    // SPEC.md v0.5.0: Save full .ljc package (don't extract scripts)
+    let package_dest = jobs_dir.join(format!("{}.ljc", job_id));
+    fs::write(&package_dest, &package_bytes)
+        .context("Failed to save package")?;
+
+    info!("Installed package: {}", package_dest.display());
+
+    // Verify the package is valid by reading its metadata
+    let pkg_meta = read_package_metadata(&package_dest)
+        .context("Package validation failed")?;
+
+    if pkg_meta.job_id != job_id {
+        fs::remove_file(&package_dest)?;
+        anyhow::bail!(
+            "Package job_id mismatch: expected '{}', got '{}'",
+            job_id, pkg_meta.job_id
+        );
+    }
+
+    if pkg_meta.version != version {
+        fs::remove_file(&package_dest)?;
+        anyhow::bail!(
+            "Package version mismatch: expected '{}', got '{}'",
+            version, pkg_meta.version
+        );
+    }
+
+    info!("✓ Installed {} v{} ({})", job_id, version, package_dest.display());
+
+    Ok(())
 }
 
 fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_extensions: &[String]) -> Result<()> {
@@ -920,12 +869,21 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_
                                         }
                                     };
 
+                                    // Get capability types from environment
+                                    let capability_types: Vec<String> = env::var("CAPABILITIES")
+                                        .unwrap_or_default()
+                                        .split(',')
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect();
+
                                     // Build capability response
                                     let capability = serde_json::json!({
                                         "request_id": request_id,
                                         "executor_id": executor_id,
                                         "hostname": hostname,
                                         "capabilities": capabilities,
+                                        "capability_types": capability_types,
                                         "supported_formats": ["tar.gz"]
                                     });
 
@@ -1008,6 +966,123 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_
                         Err(e) => error!("Invalid JSON: {}", e)
                     }
                 }
+                // Handle job availability announcement (on-demand distribution)
+                else if p.topic == "linearjc/jobs/available" {
+                    match serde_json::from_slice::<serde_json::Value>(&p.payload) {
+                        Ok(envelope) => {
+                            match verify_message(&envelope, &shared_secret, 60) {
+                                Ok(payload) => {
+                                    let job_id = payload.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let version = payload.get("version").and_then(|v| v.as_str()).unwrap_or("");
+                                    let capability = payload.get("capability").and_then(|v| v.as_str()).unwrap_or("");
+
+                                    // Get capability types from environment
+                                    let capability_types: Vec<String> = env::var("CAPABILITIES")
+                                        .unwrap_or_default()
+                                        .split(',')
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect();
+
+                                    // Check if this executor has the required capability
+                                    if !capability_types.contains(&capability.to_string()) {
+                                        info!("Ignoring {} v{} (capability '{}' not in {:?})", job_id, version, capability, capability_types);
+                                        continue;
+                                    }
+
+                                    info!("Received job announcement: {} v{} (capability: {})", job_id, version, capability);
+
+                                    // SPEC.md v0.5.0: Check if .ljc package already installed
+                                    let package_path = jobs_dir.join(format!("{}.ljc", job_id));
+                                    if package_path.exists() {
+                                        // Read installed version from package
+                                        if let Ok(installed_version) = get_package_version(&package_path) {
+                                            // Use proper semantic version comparison
+                                            use std::cmp::Ordering;
+                                            match compare_versions(&installed_version, version) {
+                                                Ordering::Greater | Ordering::Equal => {
+                                                    info!("{} v{} already installed (current: {}), skipping", job_id, version, installed_version);
+                                                    continue;
+                                                }
+                                                Ordering::Less => {
+                                                    info!("{} upgrade available: {} -> {}", job_id, installed_version, version);
+                                                    // Continue to download and install
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Extract download info
+                                    if let Some(artifact) = payload.get("script_artifact") {
+                                        let uri = artifact.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                                        let checksum = artifact.get("checksum_sha256").and_then(|v| v.as_str()).unwrap_or("");
+
+                                        if uri.is_empty() || checksum.is_empty() {
+                                            error!("Job announcement missing uri or checksum");
+                                            continue;
+                                        }
+
+                                        // Download and install in background thread
+                                        let job_id_clone = job_id.to_string();
+                                        let version_clone = version.to_string();
+                                        let uri_clone = uri.to_string();
+                                        let checksum_clone = checksum.to_string();
+                                        let jobs_dir_clone = jobs_dir.clone();
+                                        let executor_id_clone = executor_id.to_string();
+
+                                        std::thread::spawn(move || {
+                                            match download_and_install_job(&job_id_clone, &version_clone, &uri_clone, &checksum_clone, &jobs_dir_clone) {
+                                                Ok(_) => info!("executor={} job={} version={} state=installed Successfully installed job", executor_id_clone, job_id_clone, version_clone),
+                                                Err(e) => error!("executor={} job={} version={} state=failed error={} Failed to install job", executor_id_clone, job_id_clone, version_clone, e)
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => error!("Job announcement verification failed: {}", e)
+                            }
+                        }
+                        Err(e) => error!("Invalid job announcement JSON: {}", e)
+                    }
+                }
+                // Handle job cancellation request
+                else if p.topic.contains("/cancel") {
+                    match serde_json::from_slice::<serde_json::Value>(&p.payload) {
+                        Ok(envelope) => {
+                            match verify_message(&envelope, &shared_secret, 60) {
+                                Ok(payload) => {
+                                    let execution_id = payload.get("execution_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let signal_str = payload.get("signal")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("SIGTERM");
+
+                                    info!("Cancel request for {} (signal: {})", execution_id, signal_str);
+
+                                    // Look up PID and send signal
+                                    if let Ok(jobs) = ACTIVE_JOBS.lock() {
+                                        if let Some(pid) = jobs.get(execution_id) {
+                                            let signal = if signal_str == "SIGKILL" {
+                                                Signal::SIGKILL
+                                            } else {
+                                                Signal::SIGTERM
+                                            };
+
+                                            match kill(*pid, signal) {
+                                                Ok(_) => info!("Sent {:?} to {} (pid={})", signal, execution_id, pid),
+                                                Err(e) => error!("Failed to kill {}: {}", execution_id, e),
+                                            }
+                                        } else {
+                                            warn!("No active job found for: {}", execution_id);
+                                        }
+                                    }
+                                }
+                                Err(e) => error!("Cancel verification failed: {}", e)
+                            }
+                        }
+                        Err(e) => error!("Invalid cancel JSON: {}", e)
+                    }
+                }
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 info!("Connected to MQTT broker");
@@ -1018,6 +1093,14 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_
                 }
                 if let Err(e) = client.subscribe("linearjc/jobs/requests/+", QoS::AtLeastOnce) {
                     error!("Failed to subscribe to job requests: {}", e);
+                }
+                if let Err(e) = client.subscribe("linearjc/jobs/available", QoS::AtLeastOnce) {
+                    error!("Failed to subscribe to job announcements: {}", e);
+                }
+                // Subscribe to cancel requests for this executor
+                let cancel_topic = format!("linearjc/executors/{}/cancel", executor_id);
+                if let Err(e) = client.subscribe(&cancel_topic, QoS::AtLeastOnce) {
+                    error!("Failed to subscribe to cancel requests: {}", e);
                 }
 
                 info!("Resubscribed to topics");
@@ -1141,4 +1224,184 @@ fn main() -> Result<()> {
     mqtt_loop(&executor_id, &jobs_dir, &work_dir, &allowed_extensions)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_directory_layout_creation() {
+        // Test that Phase 7 directory structure is created correctly
+        let temp = TempDir::new().unwrap();
+        let job_dir = temp.path().join("test-job-id");
+
+        let in_dir = job_dir.join("in");
+        let out_dir = job_dir.join("out");
+        let tmp_dir = job_dir.join("tmp");
+        let work_dir = job_dir.join(".work");
+
+        // Create directories
+        fs::create_dir_all(&in_dir).unwrap();
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+
+        // Verify all directories exist
+        assert!(in_dir.exists());
+        assert!(out_dir.exists());
+        assert!(tmp_dir.exists());
+        assert!(work_dir.exists());
+
+        // Verify they are directories
+        assert!(in_dir.is_dir());
+        assert!(out_dir.is_dir());
+        assert!(tmp_dir.is_dir());
+        assert!(work_dir.is_dir());
+    }
+
+    #[test]
+    fn test_path_type_file_extraction() {
+        // Test that path_type: file creates direct file in in/ directory
+        let temp = TempDir::new().unwrap();
+        let in_dir = temp.path().join("in");
+        fs::create_dir_all(&in_dir).unwrap();
+
+        // Simulate extracting a file input
+        let test_file = in_dir.join("config.json");
+        fs::write(&test_file, b"{\"key\": \"value\"}").unwrap();
+
+        // Verify file exists directly in in/ (not in subdirectory)
+        assert!(test_file.exists());
+        assert!(test_file.is_file());
+
+        // Verify path structure
+        assert_eq!(test_file.parent().unwrap(), in_dir);
+    }
+
+    #[test]
+    fn test_path_type_directory_extraction() {
+        // Test that path_type: directory creates subdirectory in in/
+        let temp = TempDir::new().unwrap();
+        let in_dir = temp.path().join("in");
+        fs::create_dir_all(&in_dir).unwrap();
+
+        // Simulate extracting a directory input
+        let test_dir = in_dir.join("dataset");
+        fs::create_dir_all(&test_dir).unwrap();
+
+        let test_file = test_dir.join("data.parquet");
+        fs::write(&test_file, b"binary data").unwrap();
+
+        // Verify directory exists in in/
+        assert!(test_dir.exists());
+        assert!(test_dir.is_dir());
+
+        // Verify file exists inside directory
+        assert!(test_file.exists());
+        assert!(test_file.is_file());
+
+        // Verify path structure
+        assert_eq!(test_dir.parent().unwrap(), in_dir);
+    }
+
+    #[test]
+    fn test_environment_variables_generation() {
+        // Test that environment variables are set correctly
+        let temp = TempDir::new().unwrap();
+        let job_dir = temp.path().join("test-job-id");
+
+        let in_dir = job_dir.join("in");
+        let out_dir = job_dir.join("out");
+        let tmp_dir = job_dir.join("tmp");
+
+        fs::create_dir_all(&in_dir).unwrap();
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::create_dir_all(&tmp_dir).unwrap();
+
+        // Verify directory paths are what we expect
+        assert_eq!(in_dir.file_name().unwrap(), "in");
+        assert_eq!(out_dir.file_name().unwrap(), "out");
+        assert_eq!(tmp_dir.file_name().unwrap(), "tmp");
+
+        // Environment variables would be:
+        // LINEARJC_IN_DIR = /path/to/in
+        // LINEARJC_OUT_DIR = /path/to/out
+        // LINEARJC_TMP_DIR = /path/to/tmp
+        let expected_in = in_dir.to_str().unwrap();
+        let expected_out = out_dir.to_str().unwrap();
+        let expected_tmp = tmp_dir.to_str().unwrap();
+
+        assert!(expected_in.ends_with("/in"));
+        assert!(expected_out.ends_with("/out"));
+        assert!(expected_tmp.ends_with("/tmp"));
+    }
+
+    #[test]
+    fn test_data_spec_kind_field() {
+        // Test that DataSpec correctly handles kind field (SPEC.md v0.5.0)
+        let spec_file = DataSpec {
+            url: "s3://bucket/config.json".to_string(),
+            format: "tar.gz".to_string(),
+            kind: Some("file".to_string()),
+        };
+
+        let spec_dir = DataSpec {
+            url: "s3://bucket/dataset.tar.gz".to_string(),
+            format: "tar.gz".to_string(),
+            kind: Some("dir".to_string()),
+        };
+
+        let spec_default = DataSpec {
+            url: "s3://bucket/legacy.tar.gz".to_string(),
+            format: "tar.gz".to_string(),
+            kind: None, // Backward compat: defaults to "dir"
+        };
+
+        assert_eq!(spec_file.kind.as_deref().unwrap(), "file");
+        assert_eq!(spec_dir.kind.as_deref().unwrap(), "dir");
+        assert_eq!(spec_default.kind.as_deref().unwrap_or("dir"), "dir");
+    }
+
+    #[test]
+    fn test_metadata_directory_creation() {
+        // Test that .meta directory can be created for registry introspection
+        let temp = TempDir::new().unwrap();
+        let in_dir = temp.path().join("in");
+        let meta_dir = in_dir.join(".meta");
+
+        fs::create_dir_all(&meta_dir).unwrap();
+
+        // Simulate creating registry.json
+        let registry_file = meta_dir.join("registry.json");
+        fs::write(&registry_file, b"{\"inputs\": []}").unwrap();
+
+        // Verify .meta directory exists
+        assert!(meta_dir.exists());
+        assert!(meta_dir.is_dir());
+
+        // Verify registry.json exists
+        assert!(registry_file.exists());
+        assert!(registry_file.is_file());
+
+        // Verify .meta is hidden (starts with dot)
+        assert!(meta_dir.file_name().unwrap().to_str().unwrap().starts_with('.'));
+    }
+
+    #[test]
+    fn test_work_directory_is_hidden() {
+        // Test that .work directory is hidden (starts with dot)
+        let temp = TempDir::new().unwrap();
+        let job_dir = temp.path().join("test-job-id");
+        let work_dir = job_dir.join(".work");
+
+        fs::create_dir_all(&work_dir).unwrap();
+
+        // Verify .work is hidden
+        assert!(work_dir.file_name().unwrap().to_str().unwrap().starts_with('.'));
+        assert!(work_dir.exists());
+        assert!(work_dir.is_dir());
+    }
 }

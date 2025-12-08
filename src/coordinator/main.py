@@ -21,6 +21,7 @@ from coordinator.capability_discovery import ExecutorRegistry
 from coordinator.job_tracker import JobTracker, JobExecution, JobState
 from coordinator.output_locks import OutputLockManager
 from coordinator.tree_validation import TreeOutputValidator, OutputConflictError
+from coordinator.developer_api import DeveloperAPI
 from coordinator.logging_utils import (
     setup_logging,
     set_correlation_ids,
@@ -37,6 +38,37 @@ from coordinator.security_utils import (
 
 # Setup logging will be called in main()
 logger = logging.getLogger(__name__)
+
+
+def compare_versions(v1: str, v2: str) -> int:
+    """
+    Compare semantic versions.
+
+    Args:
+        v1: First version string (e.g., "1.2.3")
+        v2: Second version string (e.g., "1.2.0")
+
+    Returns:
+        1 if v1 > v2, 0 if equal, -1 if v1 < v2
+    """
+    def parse_version(v: str) -> list:
+        try:
+            return [int(x) for x in v.split('.')]
+        except (ValueError, AttributeError):
+            return [0, 0, 0]
+
+    parts1 = parse_version(v1)
+    parts2 = parse_version(v2)
+
+    for i in range(3):
+        p1 = parts1[i] if i < len(parts1) else 0
+        p2 = parts2[i] if i < len(parts2) else 0
+        if p1 > p2:
+            return 1
+        elif p1 < p2:
+            return -1
+
+    return 0
 
 
 class Coordinator:
@@ -60,6 +92,7 @@ class Coordinator:
         self.job_tracker = None
         self.output_lock_manager = None
         self.tree_validator = None
+        self.developer_api = None
         self._reload_requested = False
 
     def load_config(self):
@@ -161,6 +194,33 @@ class Coordinator:
             logger.error(f"Failed to load data registry: {e}")
             raise
 
+    def save_data_registry(self, data_registry: dict = None):
+        """Save data registry to YAML file."""
+        import yaml
+
+        registry_to_save = data_registry if data_registry is not None else self.data_registry
+
+        logger.info(f"Saving data registry to {self.config.data_registry}")
+
+        try:
+            # Convert DataRegistryEntry objects to dicts
+            registry_dict = {}
+            for key, entry in registry_to_save.items():
+                if hasattr(entry, 'model_dump'):
+                    registry_dict[key] = entry.model_dump(exclude_none=True)
+                else:
+                    registry_dict[key] = entry
+
+            # Write YAML file
+            with open(self.config.data_registry, 'w') as f:
+                yaml.dump({'registry': registry_dict}, f, default_flow_style=False, sort_keys=True)
+
+            logger.info(f"Saved {len(registry_dict)} registry entries")
+
+        except Exception as e:
+            logger.error(f"Failed to save data registry: {e}")
+            raise
+
     def discover_and_build_trees(self):
         """Discover jobs and build trees."""
         logger.info(f"Discovering jobs from {self.config.jobs_dir}")
@@ -242,26 +302,24 @@ class Coordinator:
             raise
 
     def validate_data_registry_references(self):
-        """Validate that all job inputs/outputs reference valid registry entries."""
+        """Validate that all job reads/writes reference valid registry entries."""
         logger.info("Validating data registry references...")
 
         errors = []
         for tree in self.trees:
             for job in tree.jobs:
-                # Check inputs
-                for input_name, registry_key in job.inputs.items():
+                # Check reads
+                for registry_key in job.reads:
                     if registry_key not in self.data_registry:
                         errors.append(
-                            f"Job {job.id}: input '{input_name}' "
-                            f"references unknown registry key '{registry_key}'"
+                            f"Job {job.id}: reads unknown registry key '{registry_key}'"
                         )
 
-                # Check outputs
-                for output_name, registry_key in job.outputs.items():
+                # Check writes
+                for registry_key in job.writes:
                     if registry_key not in self.data_registry:
                         errors.append(
-                            f"Job {job.id}: output '{output_name}' "
-                            f"references unknown registry key '{registry_key}'"
+                            f"Job {job.id}: writes unknown registry key '{registry_key}'"
                         )
 
         if errors:
@@ -378,15 +436,215 @@ class Coordinator:
                 self._handle_progress_update
             )
 
+            # Initialize developer API
+            self.developer_api = DeveloperAPI(
+                minio_manager=self.minio_manager,
+                mqtt_client=self.mqtt_client,
+                shared_secret=self.config.signing.shared_secret,
+                coordinator_id="linearjc-coordinator",
+                install_callback=self.install_package_from_api,
+                exec_callback=self._exec_tree_for_dev_api,
+            )
+
+            # Register developer API handlers
+            self.mqtt_client.register_developer_deploy_request_handler(
+                self.developer_api.handle_deploy_request
+            )
+            self.mqtt_client.register_developer_deploy_complete_handler(
+                self.developer_api.handle_deploy_complete
+            )
+            # Registry sync/push handler needs access to data_registry and save callback
+            self.mqtt_client.register_developer_registry_sync_handler(
+                lambda envelope, client_id: self.developer_api.handle_registry_sync_request(
+                    envelope, client_id, self.data_registry, self.save_data_registry
+                )
+            )
+            # Exec handler needs access to trees
+            self.mqtt_client.register_developer_exec_handler(
+                lambda envelope, client_id: self.developer_api.handle_exec_request(
+                    envelope, client_id, self.trees
+                )
+            )
+            # Tail handler needs access to job_tracker
+            self.mqtt_client.register_developer_tail_handler(
+                lambda envelope, client_id: self.developer_api.handle_tail_request(
+                    envelope, client_id, self.job_tracker
+                )
+            )
+            # Status handler needs access to trees and job_tracker
+            self.mqtt_client.register_developer_status_handler(
+                lambda envelope, client_id: self.developer_api.handle_status_request(
+                    envelope, client_id, self.trees, self.job_tracker
+                )
+            )
+            # PS handler needs access to job_tracker
+            self.mqtt_client.register_developer_ps_handler(
+                lambda envelope, client_id: self.developer_api.handle_ps_request(
+                    envelope, client_id, self.job_tracker
+                )
+            )
+            # Logs handler needs access to trees
+            self.mqtt_client.register_developer_logs_handler(
+                lambda envelope, client_id: self.developer_api.handle_logs_request(
+                    envelope, client_id, self.trees
+                )
+            )
+            # Kill handler needs access to job_tracker
+            self.mqtt_client.register_developer_kill_handler(
+                lambda envelope, client_id: self.developer_api.handle_kill_request(
+                    envelope, client_id, self.job_tracker
+                )
+            )
+
             # Connect to broker
             self.mqtt_client.connect()
 
             logger.info("MQTT client initialized successfully")
+            logger.info("Developer API initialized successfully")
 
         except Exception as e:
             logger.error(f"Failed to initialize MQTT client: {e}")
             raise
 
+
+    def _exec_tree_for_dev_api(self, tree: JobTree, dev_client_id: Optional[str] = None) -> dict:
+        """
+        Execute a tree for the developer API (immediate execution).
+
+        This wraps execute_tree to return the execution IDs needed by
+        the developer API.
+
+        Args:
+            tree: The tree to execute
+            dev_client_id: If set, forward progress updates to this developer client
+
+        Returns:
+            dict with 'tree_execution_id' and 'job_execution_id'
+
+        Raises:
+            Exception on execution failure
+        """
+        root_job = tree.root
+
+        logger.info(
+            f"Dev API executing tree: job={root_job.id}, dev_client={dev_client_id}"
+        )
+
+        # Execute the tree with dev_client_id for progress forwarding
+        # Note: dev_client_id is registered in JobTracker BEFORE MQTT publish
+        tree_execution_id = self.execute_tree(tree, dev_client_id=dev_client_id)
+        job_execution_id = f"{root_job.id}-{tree_execution_id.split('-', 1)[1]}"
+
+        return {
+            'tree_execution_id': tree_execution_id,
+            'job_execution_id': job_execution_id,
+        }
+
+    def install_package_from_api(self, package_path: Path) -> dict:
+        """
+        Install a package from the developer API.
+
+        This is a wrapper around the install command logic that can be called
+        by the developer API.
+
+        Args:
+            package_path: Path to .ljc package file
+
+        Returns:
+            dict with 'job_id' and 'version' fields
+
+        Raises:
+            Exception on installation failure
+        """
+        import tarfile
+        import tempfile
+        import shutil
+
+        logger.info(f"Installing package from API: {package_path}")
+
+        # Create temp directory for extraction
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir).resolve()
+
+            # Extract package with security validation
+            logger.debug("Extracting package...")
+            from coordinator.archive_handler import safe_extract_member, ArchiveError
+
+            with tarfile.open(package_path, 'r:gz') as tar:
+                for member in tar.getmembers():
+                    safe_extract_member(tar, member, tmppath)
+
+            # Validate structure
+            job_yaml = tmppath / 'job.yaml'
+            script_sh = tmppath / 'script.sh'
+
+            if not job_yaml.exists():
+                raise ValueError("Package missing job.yaml")
+
+            if not script_sh.exists():
+                raise ValueError("Package missing script.sh")
+
+            # Parse job to get job_id and version
+            with open(job_yaml) as f:
+                job_data = yaml.safe_load(f)
+
+            if 'job' not in job_data or 'id' not in job_data['job']:
+                raise ValueError("Invalid job.yaml structure")
+
+            job_id = job_data['job']['id']
+            version = job_data['job'].get('version', 'unknown')
+
+            # Check for existing job and handle version upgrade
+            jobs_dir = Path(self.config.jobs_dir)
+            dest_job = jobs_dir / f"{job_id}.yaml"
+
+            if dest_job.exists():
+                # Load existing version
+                with open(dest_job) as f:
+                    existing_data = yaml.safe_load(f)
+                existing_version = existing_data.get('job', {}).get('version', '0.0.0')
+
+                comparison = compare_versions(version, existing_version)
+
+                if comparison > 0:
+                    # Upgrade: new version is higher
+                    logger.info(f"Upgrading job {job_id}: {existing_version} → {version}")
+                elif comparison == 0:
+                    # Same version already installed
+                    raise ValueError(
+                        f"Version {version} of {job_id} is already installed. "
+                        f"Bump the version to deploy a new package."
+                    )
+                else:
+                    # Downgrade attempt
+                    raise ValueError(
+                        f"Cannot downgrade {job_id}: {version} < {existing_version}. "
+                        f"Only upgrades are allowed."
+                    )
+            else:
+                logger.info(f"Installing new job: {job_id} v{version}")
+
+            # Cache original .ljc package
+            packages_dir = Path(self.config.jobs_dir).parent / 'packages'
+            packages_dir.mkdir(exist_ok=True)
+            dest_package = packages_dir / f"{job_id}.ljc"
+            shutil.copy2(package_path, dest_package)
+            logger.debug(f"Cached package: {dest_package}")
+
+            # Copy job.yaml to jobs directory (dest_job already defined above)
+            shutil.copy2(job_yaml, dest_job)
+            logger.info(f"Installed job definition: {dest_job}")
+
+            # TODO: Merge data registry if exists (skipping for now)
+
+            # Trigger reload
+            logger.info("Triggering coordinator reload (SIGHUP)")
+            self._reload_requested = True
+
+            return {
+                'job_id': job_id,
+                'version': version
+            }
 
     def _handle_progress_update(self, job_execution_id: str, message: dict):
         """Handle job progress update."""
@@ -410,29 +668,76 @@ class Coordinator:
                 state=state
             )
 
+            # Forward progress to developer if this is a dev execution
+            # Note: dev_client_id is stored in JobExecution, set BEFORE MQTT publish
+            job_exec = self.job_tracker.get_job(job_execution_id)
+            if job_exec and job_exec.dev_client_id:
+                self._forward_progress_to_dev_client(job_exec.dev_client_id, job_execution_id, message)
+
             # Update job tracker
             self.job_tracker.handle_progress_update(job_execution_id, message)
 
-            # Collect outputs and unregister when job completes (terminal state)
+            # Handle terminal states (completed, failed, timeout)
             if state in ('completed', 'failed', 'timeout'):
                 if tree_exec_id:
                     tree = self._find_tree_by_execution_id(tree_exec_id)
                     if tree:
-                        # Download outputs from MinIO and write to filesystem paths
-                        if state == 'completed':
+                        job_exec = self.job_tracker.get_job(job_execution_id)
+                        current_job_index = job_exec.job_index if job_exec else 0
+                        is_last_job = (current_job_index >= len(tree.jobs) - 1)
+
+                        if state == 'completed' and not is_last_job:
+                            # Chain continuation: execute next job
+                            next_job_index = current_job_index + 1
+                            next_job = tree.jobs[next_job_index]
+                            logger.info(
+                                f"Chain continuation: {tree.jobs[current_job_index].id} → {next_job.id} "
+                                f"(job {next_job_index + 1}/{len(tree.jobs)})"
+                            )
                             try:
-                                logger.info(f"Collecting outputs for {tree.root.id}")
-                                self.job_executor.collect_tree_outputs(tree, tree_exec_id)
-                                logger.info(f"Outputs collected successfully for {tree.root.id}")
+                                # Pass dev_client_id for progress forwarding
+                                dev_client = job_exec.dev_client_id if job_exec else None
+                                self._execute_chain_job(
+                                    tree,
+                                    tree_exec_id,
+                                    next_job_index,
+                                    dev_client_id=dev_client
+                                )
                             except Exception as e:
                                 logger.error(
-                                    f"Failed to collect outputs for {tree.root.id}: {e}",
+                                    f"Failed to execute chain job {next_job.id}: {e}",
                                     exc_info=True
                                 )
-                                # Continue to unregister locks even if collection fails
+                                # Unregister tree on chain failure
+                                logger.info(f"Unregistering tree outputs due to chain failure")
+                                self.tree_validator.unregister_tree(tree)
+                        else:
+                            # Terminal state: collect outputs and cleanup
+                            if state == 'completed':
+                                # Last job completed - collect outputs from leaf job
+                                try:
+                                    logger.info(
+                                        f"Chain complete: collecting outputs from {tree.jobs[-1].id} "
+                                        f"(tree: {tree.root.id})"
+                                    )
+                                    self.job_executor.collect_tree_outputs(tree, tree_exec_id)
+                                    logger.info(f"Outputs collected successfully for {tree.root.id}")
+                                except Exception as e:
+                                    logger.error(
+                                        f"Failed to collect outputs for {tree.root.id}: {e}",
+                                        exc_info=True
+                                    )
+                                    # Continue to unregister locks even if collection fails
+                            else:
+                                # Failed or timeout - log the failure
+                                failed_job = tree.jobs[current_job_index]
+                                logger.warning(
+                                    f"Chain terminated: {failed_job.id} {state} "
+                                    f"(job {current_job_index + 1}/{len(tree.jobs)})"
+                                )
 
-                        logger.info(f"Unregistering tree outputs for {tree.root.id}")
-                        self.tree_validator.unregister_tree(tree)
+                            logger.info(f"Unregistering tree outputs for {tree.root.id}")
+                            self.tree_validator.unregister_tree(tree)
                     else:
                         logger.warning(
                             f"Could not find tree for execution ID: {tree_exec_id}"
@@ -444,6 +749,47 @@ class Coordinator:
 
         finally:
             clear_correlation_ids()
+
+    def _forward_progress_to_dev_client(
+        self,
+        dev_client_id: str,
+        job_execution_id: str,
+        message: dict
+    ) -> None:
+        """
+        Forward progress update to a developer client via MQTT.
+
+        Args:
+            dev_client_id: Developer client ID to forward to
+            job_execution_id: Job execution ID
+            message: Progress message from executor
+        """
+        topic = f"linearjc/dev/progress/{dev_client_id}"
+
+        try:
+            # Build progress message for developer
+            progress = {
+                'job_execution_id': job_execution_id,
+                'state': message.get('state'),
+                'message': message.get('message', ''),
+                'executor_id': message.get('executor_id'),
+                'tree_execution_id': message.get('tree_execution_id'),
+            }
+
+            # Include error/exit_code for terminal states
+            state = message.get('state')
+            if state in ('failed', 'timeout'):
+                progress['error'] = message.get('error', '')
+                progress['exit_code'] = message.get('exit_code', 1)
+
+            self.mqtt_client.publish_message(topic, progress, qos=1)
+
+            logger.debug(
+                f"Forwarded progress to dev client {dev_client_id}: state={state}"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to forward progress to {dev_client_id}: {e}")
 
     def _find_tree_by_execution_id(self, tree_execution_id: str) -> Optional[JobTree]:
         """
@@ -483,12 +829,150 @@ class Coordinator:
 
         return None
 
-    def execute_tree(self, tree: JobTree) -> str:
+    def _execute_chain_job(
+        self,
+        tree: JobTree,
+        tree_execution_id: str,
+        job_index: int,
+        dev_client_id: Optional[str] = None
+    ) -> str:
+        """
+        Execute a non-root job in a chain.
+
+        Called by progress handler when previous job completes.
+
+        Args:
+            tree: Job tree containing the chain
+            tree_execution_id: Execution ID (same for all jobs in chain)
+            job_index: Index of job in tree.jobs[] to execute
+            dev_client_id: If set, forward progress to this developer client
+
+        Returns:
+            job_execution_id of the new job
+
+        Raises:
+            Exception on execution failure
+        """
+        job = tree.jobs[job_index]
+        prev_job = tree.jobs[job_index - 1]
+
+        # Generate job_execution_id using same timestamp portion as tree_execution_id
+        timestamp_part = tree_execution_id.split('-', 1)[1]  # YYYYMMDD-HHMMSS-uuid8
+        job_execution_id = f"{job.id}-{timestamp_part}"
+
+        # Set correlation IDs for logging
+        set_correlation_ids(
+            tree_exec_id=tree_execution_id,
+            job_exec_id=job_execution_id
+        )
+
+        try:
+            log_with_fields(
+                logger, logging.INFO,
+                f"Executing chain job {job_index + 1}/{len(tree.jobs)}",
+                job_id=job.id,
+                prev_job_id=prev_job.id,
+                state="starting"
+            )
+
+            # Prepare inputs (may come from previous job's outputs)
+            with log_duration("chain_input_preparation", logger, inputs=len(job.reads)):
+                prepared_inputs = self.job_executor.prepare_chain_job_inputs(
+                    job,
+                    prev_job,
+                    tree,
+                    tree_execution_id
+                )
+
+            # Prepare outputs
+            with log_duration("output_preparation", logger, outputs=len(job.writes)):
+                prepared_outputs = self.job_executor.prepare_job_outputs(
+                    job,
+                    tree_execution_id
+                )
+
+            # Build job request
+            job_request = self.job_executor.build_job_request(
+                job,
+                tree_execution_id,
+                job_execution_id,
+                prepared_inputs,
+                prepared_outputs
+            )
+
+            # Find executor for job
+            if self.executor_registry.is_stale():
+                self.executor_registry.query_capabilities()
+
+            executor_id = self.executor_registry.find_executor(job.id, job.version)
+
+            # Try on-demand distribution if needed
+            if not executor_id:
+                log_with_fields(
+                    logger, logging.INFO,
+                    f"No executor has {job.id} cached, attempting on-demand distribution"
+                )
+                executor_id = self._distribute_job_on_demand(job.id, job.version)
+                if not executor_id:
+                    raise Exception(f"No pool executors available for {job.id}")
+
+                if not self._wait_for_job_ready(executor_id, job.id, job.version, timeout=60):
+                    raise Exception(f"Executor {executor_id} failed to install {job.id}")
+
+            job_request['assigned_to'] = executor_id
+
+            # Track job execution
+            now = time.time()
+            job_exec = JobExecution(
+                job_execution_id=job_execution_id,
+                tree_execution_id=tree_execution_id,
+                job_id=job.id,
+                job_version=job.version,
+                state=JobState.QUEUED,
+                executor_id=executor_id,
+                assigned_at=now,
+                timeout_at=now + job.run.timeout,
+                last_progress=now,
+                dev_client_id=dev_client_id,
+                job_index=job_index,
+            )
+            self.job_tracker.add(job_exec)
+
+            # Publish to MQTT
+            log_with_fields(
+                logger, logging.INFO,
+                "Publishing chain job request to MQTT",
+                state="publishing",
+                executor=executor_id
+            )
+            self.mqtt_client.publish_job_request(job_execution_id, job_request)
+
+            log_with_fields(
+                logger, logging.INFO,
+                f"Chain job {job_index + 1}/{len(tree.jobs)} scheduled",
+                state="scheduled"
+            )
+
+            return job_execution_id
+
+        except Exception as e:
+            log_with_fields(
+                logger, logging.ERROR,
+                f"Chain job execution failed: {e}",
+                state="failed",
+                error=str(e)
+            )
+            raise
+        finally:
+            clear_correlation_ids()
+
+    def execute_tree(self, tree: JobTree, dev_client_id: Optional[str] = None) -> str:
         """
         Execute a tree by publishing its root job.
 
         Args:
             tree: The tree to execute
+            dev_client_id: If set, forward progress updates to this developer client
 
         Returns:
             tree_execution_id if successful
@@ -527,14 +1011,14 @@ class Coordinator:
             )
 
             # Prepare inputs with timing
-            with log_duration("input_preparation", logger, inputs=len(root_job.inputs)):
+            with log_duration("input_preparation", logger, inputs=len(root_job.reads)):
                 prepared_inputs = self.job_executor.prepare_tree_inputs(
                     tree,
                     tree_execution_id
                 )
 
             # Prepare outputs
-            with log_duration("output_preparation", logger, outputs=len(root_job.outputs)):
+            with log_duration("output_preparation", logger, outputs=len(root_job.writes)):
                 prepared_outputs = self.job_executor.prepare_job_outputs(
                     root_job,
                     tree_execution_id
@@ -555,13 +1039,31 @@ class Coordinator:
                 self.executor_registry.query_capabilities()
 
             executor_id = self.executor_registry.find_executor(root_job.id, root_job.version)
+
+            # If no executor has job cached, try on-demand distribution
             if not executor_id:
-                raise Exception(f"No executor available for {root_job.id} v{root_job.version}")
+                log_with_fields(
+                    logger, logging.INFO,
+                    f"No executor has {root_job.id} cached, attempting on-demand distribution",
+                    job_id=root_job.id,
+                    version=root_job.version
+                )
+
+                # Distribute to pool executor
+                executor_id = self._distribute_job_on_demand(root_job.id, root_job.version)
+                if not executor_id:
+                    raise Exception(f"No pool executors available for {root_job.id} v{root_job.version}")
+
+                # Wait for executor to install the job
+                if not self._wait_for_job_ready(executor_id, root_job.id, root_job.version, timeout=60):
+                    raise Exception(f"Executor {executor_id} failed to install {root_job.id} in time")
 
             # Add assigned_to field
             job_request['assigned_to'] = executor_id
 
             # Track job execution (reuse 'now' from tree tracking above)
+            # Note: dev_client_id is set BEFORE MQTT publish to avoid race conditions
+            # job_index=0 for root job (first in chain)
             job_exec = JobExecution(
                 job_execution_id=job_execution_id,
                 tree_execution_id=tree_execution_id,
@@ -570,8 +1072,10 @@ class Coordinator:
                 state=JobState.QUEUED,
                 executor_id=executor_id,
                 assigned_at=now,
-                timeout_at=now + root_job.executor.timeout,
-                last_progress=now
+                timeout_at=now + root_job.run.timeout,
+                last_progress=now,
+                dev_client_id=dev_client_id,
+                job_index=0,  # Root job is at index 0 in tree.jobs[]
             )
             self.job_tracker.add(job_exec)
 
@@ -722,6 +1226,189 @@ class Coordinator:
             logger.error(f"Fatal error in scheduler loop: {e}", exc_info=True)
             raise
 
+    def _compute_sha256(self, file_path: Path) -> str:
+        """
+        Compute SHA256 checksum of a file.
+
+        Args:
+            file_path: Path to file
+
+        Returns:
+            Hex-encoded SHA256 checksum
+        """
+        import hashlib
+
+        sha256 = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    def _read_manifest(self, package_path: Path) -> dict:
+        """
+        Extract and read manifest.yaml from .ljc package.
+
+        Args:
+            package_path: Path to .ljc file
+
+        Returns:
+            Manifest data as dictionary
+
+        Raises:
+            Exception: If manifest cannot be read
+        """
+        import tarfile
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir).resolve()
+
+            # Extract manifest.yaml only with security validation
+            from coordinator.archive_handler import safe_extract_member, ArchiveError
+
+            with tarfile.open(package_path, 'r:gz') as tar:
+                # Check if manifest exists
+                try:
+                    manifest_member = tar.getmember('manifest.yaml')
+                except KeyError:
+                    raise Exception(f"Package {package_path} missing manifest.yaml")
+
+                # Use safe extraction
+                safe_extract_member(tar, manifest_member, tmppath)
+
+            # Read manifest
+            manifest_file = tmppath / 'manifest.yaml'
+            with open(manifest_file) as f:
+                return yaml.safe_load(f)
+
+    def _distribute_job_on_demand(self, job_id: str, version: str) -> Optional[str]:
+        """
+        Upload job package to MinIO and announce availability via MQTT.
+
+        Args:
+            job_id: Job identifier
+            version: Job version
+
+        Returns:
+            Selected executor_id, or None if no pool executors available
+
+        Raises:
+            Exception: If distribution fails
+        """
+        # Find pool executors
+        pool_executors = self.executor_registry.find_by_capability_type("pool")
+        if not pool_executors:
+            logger.error("No pool executors available for on-demand distribution")
+            return None
+
+        # Pick first available pool executor
+        executor_id = pool_executors[0]
+        logger.info(f"Distributing {job_id} v{version} on-demand to {executor_id}")
+
+        # Check if cached package exists
+        packages_dir = Path(self.config.jobs_dir).parent / 'packages'
+        package_path = packages_dir / f"{job_id}.ljc"
+
+        if not package_path.exists():
+            raise Exception(f"Cached package not found: {package_path}")
+
+        # Read manifest to get unpacked size
+        try:
+            manifest = self._read_manifest(package_path)
+            unpacked_size = manifest.get('unpacked_size', {}).get('total_bytes', 0)
+        except Exception as e:
+            logger.warning(f"Could not read manifest, using default size: {e}")
+            unpacked_size = 0
+
+        # Compute checksum
+        checksum = self._compute_sha256(package_path)
+        logger.debug(f"Package checksum: {checksum}")
+
+        # Upload to MinIO (temp storage, 24h TTL handled by cleanup)
+        minio_bucket = self.config.minio.temp_bucket
+        minio_key = f"temp/{job_id}-v{version}.ljc"
+
+        logger.info(f"Uploading to MinIO: s3://{minio_bucket}/{minio_key}")
+        self.minio_manager.upload_file(
+            str(package_path),
+            minio_bucket,
+            minio_key,
+            content_type="application/gzip"
+        )
+
+        # Generate pre-signed download URL (valid for 10 minutes)
+        # Executor downloads immediately after receiving MQTT announcement
+        download_url = self.minio_manager.generate_presigned_get_url(
+            minio_bucket,
+            minio_key,
+            expires_seconds=600  # 10 minutes
+        )
+        logger.debug(f"Generated download URL (expires in 10 minutes)")
+
+        # Announce job availability via MQTT
+        announcement = {
+            "job_id": job_id,
+            "version": version,
+            "capability": "pool",
+            "script_artifact": {
+                "uri": download_url,
+                "checksum_sha256": checksum,
+                "unpacked_size_bytes": unpacked_size
+            }
+        }
+
+        logger.info(f"Publishing job announcement: linearjc/jobs/available")
+        self.mqtt_client.publish_message(
+            "linearjc/jobs/available",
+            announcement,
+            qos=1
+        )
+
+        logger.info(f"✓ Job {job_id} v{version} distributed to MinIO and announced")
+        return executor_id
+
+    def _wait_for_job_ready(
+        self,
+        executor_id: str,
+        job_id: str,
+        version: str,
+        timeout: int = 60
+    ) -> bool:
+        """
+        Wait for executor to install job after on-demand distribution.
+
+        Args:
+            executor_id: Executor to wait for
+            job_id: Job identifier
+            version: Job version
+            timeout: Maximum wait time in seconds
+
+        Returns:
+            True if job installed in time, False otherwise
+        """
+        logger.info(f"Waiting for {executor_id} to install {job_id} v{version} (timeout: {timeout}s)")
+
+        deadline = time.time() + timeout
+        poll_interval = 2  # Query every 2 seconds
+
+        while time.time() < deadline:
+            # Refresh executor capabilities
+            self.executor_registry.query_capabilities()
+
+            # Check if executor has the job now
+            if self.executor_registry.has_job(executor_id, job_id, version):
+                logger.info(f"✓ Executor {executor_id} has installed {job_id} v{version}")
+                return True
+
+            # Wait before next check
+            remaining = deadline - time.time()
+            wait_time = min(poll_interval, remaining)
+            if wait_time > 0:
+                time.sleep(wait_time)
+
+        logger.error(f"Timeout waiting for {executor_id} to install {job_id} v{version}")
+        return False
+
     def publish_test_job(self):
         """
         Publish a test job request to MQTT.
@@ -785,10 +1472,10 @@ class Coordinator:
             logger.info("Job details:")
             logger.info(f"  Job ID: {root_job.id} v{root_job.version}")
             logger.info(f"  Execution ID: {job_execution_id}")
-            logger.info(f"  Inputs: {list(prepared_inputs.keys())}")
-            logger.info(f"  Outputs: {list(prepared_outputs.keys())}")
-            logger.info(f"  User: {root_job.executor.user}")
-            logger.info(f"  Timeout: {root_job.executor.timeout}s")
+            logger.info(f"  Reads: {list(prepared_inputs.keys())}")
+            logger.info(f"  Writes: {list(prepared_outputs.keys())}")
+            logger.info(f"  User: {root_job.run.user}")
+            logger.info(f"  Timeout: {root_job.run.timeout}s")
             logger.info("")
 
             return tree_execution_id
@@ -1161,6 +1848,107 @@ def timeline(ctx, hours):
     click.echo("")
     click.echo("Example:")
     click.echo("  grep -E '(Tree scheduled|Job completed)' logs/coordinator.log | tail -20")
+
+
+@cli.command()
+@click.argument('package', type=click.Path(exists=True))
+@click.pass_context
+def install(ctx, package):
+    """Install a job package (.ljc file)."""
+    import tarfile
+    import tempfile
+    import shutil
+    from pathlib import Path
+
+    config_path = ctx.obj['config_path']
+
+    try:
+        # Load config
+        with open(config_path) as f:
+            config_data = yaml.safe_load(f)
+        config_file = CoordinatorConfigFile(**config_data)
+        config = config_file.coordinator
+
+        click.echo(f"Installing package: {package}")
+
+        # Create temp directory for extraction
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            # Extract package
+            click.echo("  Extracting package...")
+            with tarfile.open(package, 'r:gz') as tar:
+                tar.extractall(tmppath)
+
+            # Validate structure
+            job_yaml = tmppath / 'job.yaml'
+            script_sh = tmppath / 'script.sh'
+
+            if not job_yaml.exists():
+                click.echo("  ERROR: Package missing job.yaml", err=True)
+                sys.exit(1)
+
+            if not script_sh.exists():
+                click.echo("  ERROR: Package missing script.sh", err=True)
+                sys.exit(1)
+
+            # Parse job to get job_id
+            with open(job_yaml) as f:
+                job_data = yaml.safe_load(f)
+
+            if 'job' not in job_data or 'id' not in job_data['job']:
+                click.echo("  ERROR: Invalid job.yaml structure", err=True)
+                sys.exit(1)
+
+            job_id = job_data['job']['id']
+            click.echo(f"  Job ID: {job_id}")
+
+            # Cache original .ljc package for on-demand distribution
+            packages_dir = Path(config.jobs_dir).parent / 'packages'
+            packages_dir.mkdir(exist_ok=True)
+            dest_package = packages_dir / f"{job_id}.ljc"
+            shutil.copy2(package, dest_package)
+            click.echo(f"  Cached package: {dest_package}")
+
+            # Copy job.yaml to jobs directory
+            jobs_dir = Path(config.jobs_dir)
+            dest_job = jobs_dir / f"{job_id}.yaml"
+
+            click.echo(f"  Installing job definition: {dest_job}")
+            shutil.copy2(job_yaml, dest_job)
+
+            # Note: Registry entries are managed separately via 'ljc registry push'
+            # (see SPEC.md). Packages do NOT contain registry definitions.
+
+            # Send SIGHUP to reload coordinator (hot reload without restart)
+            click.echo("")
+            try:
+                pid_file = Path('/var/run/coordinator.pid')
+                if pid_file.exists():
+                    with open(pid_file) as f:
+                        pid = int(f.read().strip())
+                    import os
+                    os.kill(pid, signal.SIGHUP)
+                    click.echo("✓ Package installed successfully")
+                    click.echo("✓ Reloaded coordinator (SIGHUP)")
+                else:
+                    click.echo("✓ Package installed successfully")
+                    click.echo("  Note: Coordinator not running (will load on next start)")
+            except (FileNotFoundError, ProcessLookupError, PermissionError) as e:
+                click.echo("✓ Package installed successfully")
+                click.echo(f"  Note: Could not reload coordinator ({e})")
+
+            click.echo("")
+            click.echo("Next steps:")
+            click.echo(f"  1. Deploy script to executor: {script_sh}")
+            click.echo(f"     OR wait for Phase 3 on-demand distribution")
+            click.echo(f"  2. Check job discovered: linearjc-coordinator status")
+
+    except Exception as e:
+        click.echo(f"ERROR: {e}", err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 def main():

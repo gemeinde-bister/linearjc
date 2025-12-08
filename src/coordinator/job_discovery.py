@@ -134,11 +134,11 @@ def validate_jobs(jobs: List[Job]) -> Dict[str, List[str]]:
         job_errors = []
 
         # Check for self-dependency
-        if job.id in job.depends_on:
+        if job.id in job.depends:
             job_errors.append(f"Job depends on itself")
 
         # Check that all dependencies exist
-        for dep_id in job.depends_on:
+        for dep_id in job.depends:
             if dep_id not in job_ids:
                 job_errors.append(f"Dependency '{dep_id}' does not exist")
 

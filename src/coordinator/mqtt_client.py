@@ -59,6 +59,15 @@ class MqttClient:
         self.capability_handlers: list[Callable[[Dict[str, Any]], None]] = []
         self.capability_response_handlers: list[Callable[[str, Dict[str, Any]], None]] = []
         self.progress_handlers: list[Callable[[str, Dict[str, Any]], None]] = []
+        self.developer_deploy_request_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_deploy_complete_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_registry_sync_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_exec_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_tail_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_status_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_ps_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_logs_handlers: list[Callable[[Dict[str, Any], str], None]] = []
+        self.developer_kill_handlers: list[Callable[[Dict[str, Any], str], None]] = []
 
         # Reconnection support
         self.should_reconnect = True
@@ -163,6 +172,41 @@ class MqttClient:
         # Subscribe to all progress updates (wildcard for all executions)
         self.client.subscribe("linearjc/jobs/progress/+")
         logger.info("Subscribed to: linearjc/jobs/progress/+")
+
+        # Subscribe to developer API topics (deploy requests)
+        self.client.subscribe(f"linearjc/deploy/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/deploy/request/{self.client_id}")
+
+        self.client.subscribe(f"linearjc/deploy/complete/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/deploy/complete/{self.client_id}")
+
+        # Subscribe to registry sync requests
+        self.client.subscribe(f"linearjc/registry/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/registry/request/{self.client_id}")
+
+        # Subscribe to dev exec requests
+        self.client.subscribe(f"linearjc/dev/exec/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/dev/exec/request/{self.client_id}")
+
+        # Subscribe to dev tail requests
+        self.client.subscribe(f"linearjc/dev/tail/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/dev/tail/request/{self.client_id}")
+
+        # Subscribe to dev status requests
+        self.client.subscribe(f"linearjc/dev/status/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/dev/status/request/{self.client_id}")
+
+        # Subscribe to dev ps requests
+        self.client.subscribe(f"linearjc/dev/ps/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/dev/ps/request/{self.client_id}")
+
+        # Subscribe to dev logs requests
+        self.client.subscribe(f"linearjc/dev/logs/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/dev/logs/request/{self.client_id}")
+
+        # Subscribe to dev kill requests
+        self.client.subscribe(f"linearjc/dev/kill/request/{self.client_id}")
+        logger.info(f"Subscribed to: linearjc/dev/kill/request/{self.client_id}")
 
     def _start_reconnect(self) -> None:
         """Start reconnection attempts in background thread."""
@@ -269,6 +313,46 @@ class MqttClient:
             elif topic.startswith("linearjc/jobs/progress/"):
                 job_execution_id = topic.split("/")[-1]
                 self._handle_progress(job_execution_id, message)
+            elif topic.startswith("linearjc/deploy/request/"):
+                # Developer API: deploy request
+                # Extract client_id from message for response routing
+                client_id = message.get('client_id', 'unknown')
+                # Note: Handlers will re-verify signature for security
+                self._handle_developer_deploy_request(envelope, client_id)
+            elif topic.startswith("linearjc/deploy/complete/"):
+                # Developer API: deploy complete
+                # Extract client_id from message for response routing
+                client_id = message.get('client_id', 'unknown')
+                # Note: Handlers will re-verify signature for security
+                self._handle_developer_deploy_complete(envelope, client_id)
+            elif topic.startswith("linearjc/registry/request/"):
+                # Developer API: registry sync request
+                client_id = message.get('client_id', 'unknown')
+                self._handle_developer_registry_sync(envelope, client_id)
+            elif topic.startswith("linearjc/dev/exec/request/"):
+                # Developer API: exec request
+                client_id = message.get('client_id', 'unknown')
+                self._handle_developer_exec_request(envelope, client_id)
+            elif topic.startswith("linearjc/dev/tail/request/"):
+                # Developer API: tail request
+                client_id = message.get('client_id', 'unknown')
+                self._handle_developer_tail_request(envelope, client_id)
+            elif topic.startswith("linearjc/dev/status/request/"):
+                # Developer API: status request
+                client_id = message.get('client_id', 'unknown')
+                self._handle_developer_status_request(envelope, client_id)
+            elif topic.startswith("linearjc/dev/ps/request/"):
+                # Developer API: ps request
+                client_id = message.get('client_id', 'unknown')
+                self._handle_developer_ps_request(envelope, client_id)
+            elif topic.startswith("linearjc/dev/logs/request/"):
+                # Developer API: logs request
+                client_id = message.get('client_id', 'unknown')
+                self._handle_developer_logs_request(envelope, client_id)
+            elif topic.startswith("linearjc/dev/kill/request/"):
+                # Developer API: kill request
+                client_id = message.get('client_id', 'unknown')
+                self._handle_developer_kill_request(envelope, client_id)
             else:
                 logger.warning(f"Unknown topic: {topic}")
 
@@ -320,6 +404,137 @@ class MqttClient:
                 handler(job_execution_id, message)
             except Exception as e:
                 logger.error(f"Progress handler error: {e}")
+
+    def _handle_developer_deploy_request(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle deploy request from developer."""
+        logger.info(f"Deploy request from developer: {client_id}")
+
+        # Call registered handlers
+        for handler in self.developer_deploy_request_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer deploy request handler error: {e}")
+
+    def _handle_developer_deploy_complete(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle deploy complete from developer."""
+        logger.info(f"Deploy complete from developer: {client_id}")
+
+        # Call registered handlers
+        for handler in self.developer_deploy_complete_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer deploy complete handler error: {e}")
+
+    def _handle_developer_registry_sync(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle registry sync request from developer."""
+        logger.info(f"Registry sync request from developer: {client_id}")
+
+        # Call registered handlers
+        for handler in self.developer_registry_sync_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer registry sync handler error: {e}")
+
+    def _handle_developer_exec_request(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle exec request from developer."""
+        logger.info(f"Exec request from developer: {client_id}")
+
+        # Call registered handlers
+        for handler in self.developer_exec_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer exec handler error: {e}")
+
+    def _handle_developer_tail_request(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle tail request from developer."""
+        logger.info(f"Tail request from developer: {client_id}")
+
+        # Call registered handlers
+        for handler in self.developer_tail_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer tail handler error: {e}")
+
+    def _handle_developer_status_request(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle status request from developer."""
+        logger.info(f"Status request from developer: {client_id}")
+
+        for handler in self.developer_status_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer status handler error: {e}")
+
+    def _handle_developer_ps_request(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle ps request from developer."""
+        logger.info(f"PS request from developer: {client_id}")
+
+        for handler in self.developer_ps_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer ps handler error: {e}")
+
+    def _handle_developer_logs_request(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle logs request from developer."""
+        logger.info(f"Logs request from developer: {client_id}")
+
+        for handler in self.developer_logs_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer logs handler error: {e}")
+
+    def _handle_developer_kill_request(
+        self,
+        envelope: Dict[str, Any],
+        client_id: str
+    ) -> None:
+        """Handle kill request from developer."""
+        logger.info(f"Kill request from developer: {client_id}")
+
+        for handler in self.developer_kill_handlers:
+            try:
+                handler(envelope, client_id)
+            except Exception as e:
+                logger.error(f"Developer kill handler error: {e}")
 
     def publish_job_request(
         self,
@@ -453,6 +668,123 @@ class MqttClient:
         """
         self.progress_handlers.append(handler)
         logger.debug("Registered progress handler")
+
+    def register_developer_deploy_request_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer deploy requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_deploy_request_handlers.append(handler)
+        logger.debug("Registered developer deploy request handler")
+
+    def register_developer_deploy_complete_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer deploy completion notifications.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_deploy_complete_handlers.append(handler)
+        logger.debug("Registered developer deploy complete handler")
+
+    def register_developer_registry_sync_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer registry sync requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_registry_sync_handlers.append(handler)
+        logger.debug("Registered developer registry sync handler")
+
+    def register_developer_exec_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer exec requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_exec_handlers.append(handler)
+        logger.debug("Registered developer exec handler")
+
+    def register_developer_tail_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer tail requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_tail_handlers.append(handler)
+        logger.debug("Registered developer tail handler")
+
+    def register_developer_status_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer status requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_status_handlers.append(handler)
+        logger.debug("Registered developer status handler")
+
+    def register_developer_ps_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer ps requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_ps_handlers.append(handler)
+        logger.debug("Registered developer ps handler")
+
+    def register_developer_logs_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer logs requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_logs_handlers.append(handler)
+        logger.debug("Registered developer logs handler")
+
+    def register_developer_kill_handler(
+        self,
+        handler: Callable[[Dict[str, Any], str], None]
+    ) -> None:
+        """
+        Register a handler for developer kill requests.
+
+        Args:
+            handler: Callback receiving (envelope, client_id)
+        """
+        self.developer_kill_handlers.append(handler)
+        logger.debug("Registered developer kill handler")
 
     def wait_for_messages(self, duration_seconds: float) -> None:
         """

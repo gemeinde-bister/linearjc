@@ -9,12 +9,16 @@ edition = "2024"
 # supply chain attacks. Review and update manually after auditing changes.
 # ============================================================================
 
+# LinearJC shared core library - isolation, execution, signing
+linearjc-core = { path = "../linearjc-core" }
+
 # MQTT client - communication with coordinator
 rumqttc = "=0.24.0"
 
 # Serialization - job request parsing
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
+serde_yaml = "=0.9.34"  # Parse job.yaml from .ljc packages
 
 # HTTP client - downloading/uploading job data from/to Minio
 # Uses rustls (pure Rust TLS) instead of OpenSSL for supply chain security
@@ -27,25 +31,22 @@ log = "=0.4.28"
 # Error handling
 anyhow = "=1.0.100"
 
-# Cryptography - HMAC-SHA256 message signing
-hmac = "=0.12.1"
-sha2 = "=0.10.9"
-hex = "=0.4.3"
-
-# Constant-time operations - prevents timing attacks on signature verification
-# CRITICAL: Used for secure signature comparison
-subtle = "=2.6.1"
-
 # Time handling - timestamp validation
 chrono = "=0.4.42"
 
 # Unix operations - setuid, chown, fork for privilege separation
-nix = { version = "=0.29.0", features = ["user", "process", "fs"] }
+nix = { version = "=0.29.0", features = ["user", "process", "fs", "sched", "signal"] }
 
-# Archive handling - replaces tar subprocess (prevents command injection)
-# CRITICAL: Used instead of tar(1) to prevent shell injection attacks
+# Cryptography - kept for sha2::Digest trait used in checksum verification
+sha2 = "=0.10.9"
+
+# Archive handling - for custom package extraction with filtering
 tar = "=0.4.44"
 flate2 = "=1.1.5"
+
+[dev-dependencies]
+# Testing utilities - temporary directories for unit tests
+tempfile = "=3.13.0"
 
 [profile.release]
 strip = true

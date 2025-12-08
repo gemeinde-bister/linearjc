@@ -68,21 +68,21 @@ class TreeOutputValidator:
         """
         fs_outputs = set()
 
-        # Only check root job outputs (tree outputs)
-        # Individual job outputs within the tree are transient
-        if tree.root.outputs:
-            for output_name, registry_key in tree.root.outputs.items():
+        # Only check root job writes (tree outputs)
+        # Individual job writes within the tree are transient
+        if tree.root.writes:
+            for registry_key in tree.root.writes:
                 if registry_key not in self.data_registry:
                     raise ValueError(
                         f"Tree '{tree.root.id}' references unknown registry key: "
-                        f"'{registry_key}' in output '{output_name}'"
+                        f"'{registry_key}'"
                     )
 
                 registry_entry = self.data_registry[registry_key]
 
                 # Only filesystem outputs can conflict
                 # MinIO outputs are isolated by unique object keys
-                if registry_entry.type == "filesystem":
+                if registry_entry.type == "fs":
                     if registry_entry.path:
                         normalized = self._normalize_path(registry_entry.path)
                         fs_outputs.add(normalized)
@@ -139,7 +139,7 @@ class TreeOutputValidator:
                 # Find registry key for this path (for better error message)
                 registry_key = None
                 for key, entry in self.data_registry.items():
-                    if entry.type == "filesystem" and entry.path:
+                    if entry.type == "fs" and entry.path:
                         if self._normalize_path(entry.path) == fs_path:
                             registry_key = key
                             break
@@ -259,12 +259,12 @@ class TreeOutputValidator:
                     if fs_path not in fs_outputs:
                         fs_outputs[fs_path] = []
 
-                    # Find which output maps to this path
-                    for output_name, registry_key in tree.root.outputs.items():
+                    # Find which write maps to this path
+                    for registry_key in tree.root.writes:
                         entry = self.data_registry[registry_key]
-                        if entry.type == "filesystem" and entry.path:
+                        if entry.type == "fs" and entry.path:
                             if self._normalize_path(entry.path) == fs_path:
-                                fs_outputs[fs_path].append((tree_id, output_name, registry_key))
+                                fs_outputs[fs_path].append((tree_id, registry_key))
                                 break
 
             except ValueError as e:
@@ -289,10 +289,9 @@ class TreeOutputValidator:
 
             for fs_path, tree_infos in conflicts:
                 error_lines.append(f"  Filesystem path: {fs_path}")
-                for tree_id, output_name, registry_key in tree_infos:
+                for tree_id, registry_key in tree_infos:
                     error_lines.append(
-                        f"    - Tree '{tree_id}' "
-                        f"(output '{output_name}' → registry '{registry_key}')"
+                        f"    - Tree '{tree_id}' (writes '{registry_key}')"
                     )
                 error_lines.append("")
 

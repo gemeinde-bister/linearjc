@@ -1,0 +1,10 @@
+# Package manifest for echo.test
+# Note: Per SPEC.md, packages do NOT contain registry definitions
+job_id: echo.test
+version: "1.0.0"
+created_at: "2025-12-03T00:00:00Z"
+files:
+  - job.yaml
+  - script.sh
+unpacked_size:
+  total_bytes: 2048

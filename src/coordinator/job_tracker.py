@@ -38,6 +38,10 @@ class JobExecution:
     timeout_at: Optional[float]
     last_progress: Optional[float]
     error_message: Optional[str] = None
+    # If set, forward progress updates to this developer client via MQTT
+    dev_client_id: Optional[str] = None
+    # Position in tree.jobs[] for multi-job chains (0 = root, 1 = second job, etc.)
+    job_index: int = 0
 
     def is_timed_out(self, now: float) -> bool:
         """Check if job has timed out."""
@@ -191,3 +195,70 @@ class JobTracker:
         """Get number of active (non-terminal) jobs."""
         terminal_states = {JobState.COMPLETED, JobState.FAILED, JobState.TIMEOUT}
         return sum(1 for job in self._jobs.values() if job.state not in terminal_states)
+
+    def find_active_by_job_id(self, job_id: str) -> Optional[JobExecution]:
+        """
+        Find active (non-terminal) execution for a job.
+
+        Args:
+            job_id: Job ID to search for
+
+        Returns:
+            Most recent active JobExecution, or None if no active execution
+        """
+        terminal_states = {JobState.COMPLETED, JobState.FAILED, JobState.TIMEOUT}
+        candidates = [
+            job for job in self._jobs.values()
+            if job.job_id == job_id and job.state not in terminal_states
+        ]
+
+        if not candidates:
+            return None
+
+        # Return most recent by job_execution_id (contains timestamp)
+        return max(candidates, key=lambda j: j.job_execution_id)
+
+    def attach_dev_client(self, job_execution_id: str, dev_client_id: str) -> bool:
+        """
+        Attach a developer client for progress forwarding.
+
+        Args:
+            job_execution_id: Execution to attach to
+            dev_client_id: Developer client ID for progress forwarding
+
+        Returns:
+            True if attached successfully, False if execution not found
+        """
+        if job_execution_id not in self._jobs:
+            logger.warning(f"Cannot attach to unknown job: {job_execution_id}")
+            return False
+
+        job = self._jobs[job_execution_id]
+        old_client = job.dev_client_id
+        job.dev_client_id = dev_client_id
+
+        if old_client:
+            logger.info(
+                f"Replaced dev client for {job_execution_id}: "
+                f"{old_client} → {dev_client_id}"
+            )
+        else:
+            logger.info(f"Attached dev client {dev_client_id} to {job_execution_id}")
+
+        return True
+
+    def find_by_tree_execution_id(self, tree_execution_id: str) -> List[JobExecution]:
+        """
+        Find all job executions for a tree.
+
+        Args:
+            tree_execution_id: Tree execution ID
+
+        Returns:
+            List of JobExecution objects for this tree, ordered by job_index
+        """
+        executions = [
+            job for job in self._jobs.values()
+            if job.tree_execution_id == tree_execution_id
+        ]
+        return sorted(executions, key=lambda j: j.job_index)

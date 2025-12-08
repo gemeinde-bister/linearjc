@@ -1,0 +1,40 @@
+# LinearJC Developer Tool Configuration
+#
+# This file configures the ljc tool for connecting to the coordinator.
+# Environment variables can override these settings.
+#
+# Required environment variable:
+#   LINEARJC_SECRET - Shared secret for HMAC authentication
+#
+# Optional environment variables:
+#   MQTT_BROKER - Override MQTT broker hostname
+#   MQTT_PORT - Override MQTT port
+#   MQTT_CLIENT_ID - Override client ID
+#   COORDINATOR_ID - Override coordinator ID
+#
+
+mqtt:
+  # MQTT broker hostname or IP address
+  # Change this to your coordinator's IP (192.0.2.1 is RFC 5737 example)
+  broker: "192.0.2.1"
+
+  # MQTT broker port
+  port: 1883
+
+  # Client ID for this developer
+  # Defaults to $USER if not specified
+  client_id: "developer-alice"
+
+  # MQTT keepalive interval in seconds
+  keepalive: 60
+
+coordinator:
+  # Coordinator ID (used in MQTT topic names)
+  # Must match the coordinator's MQTT client_id
+  id: "linearjc-coordinator"
+
+auth:
+  # Shared secret for HMAC-SHA256 message signing
+  # IMPORTANT: Use environment variable, not hardcoded value
+  # Set LINEARJC_SECRET before running ljc commands
+  shared_secret: "${LINEARJC_SECRET}"

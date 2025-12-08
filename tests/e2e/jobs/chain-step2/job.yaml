@@ -1,0 +1,14 @@
+job:
+  id: chain.step2
+  version: "1.0.0"
+  reads: [chain_intermediate]
+  writes: [chain_final_output]
+  depends: [chain.step1]
+  schedule:
+    min_daily: 1
+    max_daily: 100
+  run:
+    user: nobody
+    timeout: 30
+    isolation: none
+    network: true

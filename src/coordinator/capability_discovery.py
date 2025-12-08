@@ -20,6 +20,7 @@ class ExecutorInfo:
     executor_id: str
     hostname: str
     capabilities: List[Dict[str, str]]
+    capability_types: List[str]
     supported_formats: List[str]
     last_seen: float
     last_query_id: str
@@ -115,6 +116,7 @@ class ExecutorRegistry:
                     executor_id=executor_id,
                     hostname=response.get("hostname", "unknown"),
                     capabilities=response.get("capabilities", []),
+                    capability_types=response.get("capability_types", []),
                     supported_formats=response.get("supported_formats", []),
                     last_seen=time.time(),
                     last_query_id=request_id
@@ -174,3 +176,24 @@ class ExecutorRegistry:
         """Get number of registered executors."""
         with self._lock:
             return len(self._executors)
+
+    def find_by_capability_type(self, capability_type: str) -> List[str]:
+        """Find executors with specific capability type (e.g., 'pool')."""
+        with self._lock:
+            return [
+                executor_id
+                for executor_id, info in self._executors.items()
+                if capability_type in info.capability_types
+            ]
+
+    def has_job(self, executor_id: str, job_id: str, version: str) -> bool:
+        """Check if executor has specific job version cached."""
+        with self._lock:
+            if executor_id not in self._executors:
+                return False
+
+            info = self._executors[executor_id]
+            return any(
+                cap.get("job_id") == job_id and cap.get("version") == version
+                for cap in info.capabilities
+            )

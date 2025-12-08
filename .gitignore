@@ -62,3 +62,10 @@ data_registry.yaml
 # Binaries
 bin/minio
 bin/mc
+.hg
+
+# User config files (contain local IPs)
+.ljcconfig
+
+# Infrastructure-specific tests
+tests/phase7-e2e/

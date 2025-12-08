@@ -1,0 +1,58 @@
+[package]
+name = "ljc"
+version = "0.1.0"
+edition = "2024"
+authors = ["LinearJC Team"]
+description = "LinearJC job development and deployment tool"
+
+[[bin]]
+name = "ljc"
+path = "src/main.rs"
+
+[dependencies]
+# LinearJC shared core library - signing, archive, workdir, isolation
+linearjc-core = { path = "../../src/linearjc-core" }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "cargo"] }
+colored = "2.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+
+# Packaging - kept for custom build logic
+tar = "0.4"
+flate2 = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+regex = "1.10"
+dialoguer = "0.11"
+uuid = { version = "1.0", features = ["v4"] }
+tempfile = "3.15"
+
+# MQTT - same versions as executor for compatibility
+rumqttc = "0.24.0"
+
+# Time handling - timestamp validation
+chrono = "0.4.42"
+
+# Cryptography - SHA256 for package checksums
+sha2 = "0.10.9"
+
+# HTTP client - for MinIO uploads (rustls for security)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

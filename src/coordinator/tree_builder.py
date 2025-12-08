@@ -34,7 +34,7 @@ def build_dependency_graph(jobs: List[Job]) -> Dict[str, Set[str]]:
             graph[job.id] = set()
 
         # Add edges from dependencies to this job
-        for dep_id in job.depends_on:
+        for dep_id in job.depends:
             graph[dep_id].add(job.id)
 
     return dict(graph)
@@ -69,7 +69,7 @@ def detect_cycles(jobs: List[Job]) -> List[List[str]]:
         rec_stack.add(job_id)
 
         if job_id in job_map:
-            for dep_id in job_map[job_id].depends_on:
+            for dep_id in job_map[job_id].depends:
                 visit(dep_id, path + [job_id])
 
         rec_stack.remove(job_id)
@@ -112,7 +112,7 @@ def build_trees(jobs: List[Job]) -> List[JobTree]:
     job_map = {job.id: job for job in jobs}
 
     # Find root jobs (no dependencies)
-    roots = [job for job in jobs if not job.depends_on]
+    roots = [job for job in jobs if not job.depends]
 
     if not roots:
         raise TreeBuilderError("No root jobs found (all jobs have dependencies)")

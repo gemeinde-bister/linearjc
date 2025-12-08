@@ -13,6 +13,10 @@ from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# Clock skew tolerance (seconds)
+# Allow small time differences between coordinator and clients due to NTP sync delays
+CLOCK_SKEW_TOLERANCE = 30
+
 
 class MessageSigningError(Exception):
     """Error during message signing or verification."""
@@ -122,9 +126,10 @@ def verify_message(
     now = datetime.now(timezone.utc)
     age_seconds = (now - message_time).total_seconds()
 
-    if age_seconds < 0:
+    # Allow small clock skew for messages slightly in the future
+    if age_seconds < -CLOCK_SKEW_TOLERANCE:
         raise MessageSigningError(
-            f"Message timestamp is in the future (clock skew?)"
+            f"Message timestamp too far in future: {-age_seconds:.1f}s (max skew: {CLOCK_SKEW_TOLERANCE}s)"
         )
 
     if age_seconds > max_age_seconds:

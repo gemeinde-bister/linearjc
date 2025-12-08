@@ -1,0 +1,60 @@
+[package]
+name = "linearjc-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["LinearJC Team"]
+description = "Shared security-critical code for LinearJC executor and ljc tool"
+license = "MIT"
+
+[lib]
+name = "linearjc_core"
+path = "src/lib.rs"
+
+[dependencies]
+# ============================================================================
+# SECURITY NOTICE: Dependencies are pinned to exact versions to prevent
+# supply chain attacks. Review and update manually after auditing changes.
+# ============================================================================
+
+# Error handling
+anyhow = "=1.0.100"
+
+# Logging
+log = "=0.4.28"
+
+# Serialization - job config parsing
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+serde_yaml = "=0.9.34"
+
+# Process isolation - Landlock filesystem restrictions (Linux 5.13+)
+landlock = "=0.4.0"
+
+# Resource limits - cgroups v2 CPU/memory/process limits
+cgroups-rs = "=0.3.4"
+
+# Unix operations - setuid, chown, fork, network namespaces, signals
+nix = { version = "=0.29.0", features = ["user", "process", "fs", "sched", "signal"] }
+
+# Archive handling - secure tar.gz (prevents command injection)
+tar = "=0.4.44"
+flate2 = "=1.1.5"
+
+# Cryptography - HMAC-SHA256 message signing
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+hex = "=0.4.3"
+
+# Constant-time operations - prevents timing attacks on signature verification
+subtle = "=2.6.1"
+
+# Time handling - timestamp validation
+chrono = "=0.4.42"
+
+[dev-dependencies]
+tempfile = "=3.13.0"
+
+[features]
+default = []
+# Enable when running as root (for full isolation tests)
+root-tests = []

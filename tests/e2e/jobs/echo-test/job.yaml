@@ -1,0 +1,20 @@
+# Minimal smoke test job for local E2E testing
+# Uses root user and no isolation to run without special privileges
+job:
+  id: echo.test
+  version: "1.0.0"
+
+  reads: [echo_input]
+  writes: [echo_output]
+
+  depends: []
+
+  schedule:
+    min_daily: 1
+    max_daily: 100  # Allow frequent runs for testing
+
+  run:
+    user: root
+    timeout: 30
+    isolation: none
+    network: true

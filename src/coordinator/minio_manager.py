@@ -160,6 +160,41 @@ class MinioManager:
                 f"Failed to download s3://{bucket}/{object_name}: {e}"
             )
 
+    def download_object_to_bytes(
+        self,
+        bucket: str,
+        object_name: str
+    ) -> bytes:
+        """
+        Download an object from Minio and return as bytes.
+
+        Args:
+            bucket: Source bucket
+            object_name: Object name in bucket
+
+        Returns:
+            Object data as bytes
+
+        Raises:
+            MinioError: If download fails
+        """
+        try:
+            logger.debug(f"Downloading s3://{bucket}/{object_name} to memory")
+
+            response = self.client.get_object(bucket, object_name)
+            data = response.read()
+            response.close()
+            response.release_conn()
+
+            logger.info(f"Downloaded {len(data)} bytes from s3://{bucket}/{object_name}")
+
+            return data
+
+        except S3Error as e:
+            raise MinioError(
+                f"Failed to download s3://{bucket}/{object_name}: {e}"
+            )
+
     def generate_presigned_get_url(
         self,
         bucket: str,
