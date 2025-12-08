@@ -45,6 +45,7 @@ Notes and caveats:
   - Stateless worker that subscribes to signed job requests over MQTT.
   - Validates inputs strictly (paths, URLs, users, timeouts).
   - Runs job scripts with privilege separation (fork + setuid).
+  - Optional process isolation: Landlock filesystem sandboxing, cgroups v2 resource limits, network namespace isolation.
   - Moves data using pre‑signed URLs; archives/extracts with safe libraries.
   - Designed to run inside KVM; workloads can run inside Docker within those VMs.
 
@@ -55,7 +56,11 @@ Transport and data
 ## Security model (summary)
 - Message integrity: HMAC‑SHA256 envelopes with max‑age enforcement.
 - Principle of least privilege: executor user switching; secure work directory permissions.
-- Safe archives: library‑based tar.gz handling with path traversal checks.
+- Process isolation (opt-in per job):
+  - Landlock filesystem sandboxing (strict/relaxed/none modes).
+  - cgroups v2 resource limits (CPU, memory, process count).
+  - Network namespace isolation (optional network deny).
+- Safe archives: library‑based tar.gz handling with path traversal and symlink checks.
 - Defensive validation: strict checks for job IDs, registry keys, paths, URLs, users, and timeouts.
 - Logging: correlation IDs and metrics; avoids logging secrets or pre‑signed URLs.
 
@@ -77,7 +82,6 @@ Prerequisites
 
 Install dependencies
 ```bash
-cd .
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -121,6 +125,21 @@ python src/coordinator/main.py --config /etc/linearjc/config.yaml
 Notes
 - Example configs include development defaults (`minioadmin`, a sample shared secret). Replace before production and enable TLS.
 
+## Developer CLI (ljc)
+
+The `ljc` tool manages job development and deployment:
+- `ljc new <job>` - Create new job from template
+- `ljc validate <job>` - Validate job configuration
+- `ljc build <job>` - Package job for deployment
+- `ljc deploy <package> --to <coordinator>` - Deploy to coordinator
+- `ljc exec <job>` - Trigger immediate execution
+- `ljc ps` - List active jobs
+- `ljc logs <job>` - View execution history
+- `ljc status <job>` - Check scheduling state
+- `ljc tail <job>` - Follow job output
+
+See `ljc --help` for full documentation.
+
 ## Documentation
 
 - [Job Design Guide](docs/job-design-guide.md) - How to write job scripts and definitions
@@ -138,7 +157,11 @@ Coordinator configuration (`examples/config.yaml`) defines:
 - `security`: allowed data roots; option to validate secrets (enable in production)
 - `archive`: archive format (`tar.gz`)
 
-Executors read environment variables for `MQTT_BROKER`, `MQTT_PORT`, and `MQTT_SHARED_SECRET`, and paths for `JOBS_DIR` and `WORK_DIR`.
+Executors read environment variables:
+- `MQTT_BROKER`, `MQTT_PORT`, `MQTT_SHARED_SECRET` - MQTT connection
+- `MINIO_ENDPOINT`, `MINIO_SECURE` - MinIO connection (optional)
+- `EXECUTOR_ID`, `JOBS_DIR`, `WORK_DIR` - executor identity and paths
+- `CAPABILITIES` - comma-separated capability types (e.g., `pool`)
 
 ## Limitations
 - Linear execution only; a single path per pipeline.
@@ -157,7 +180,11 @@ Executors read environment variables for `MQTT_BROKER`, `MQTT_PORT`, and `MQTT_S
 linearjc/
 ├── src/
 │   ├── coordinator/           # Python coordinator
-│   └── executor/              # Rust executor
+│   ├── executor/              # Rust executor
+│   └── linearjc-core/         # Rust shared library (signing, isolation, archive)
+├── tools/
+│   └── ljc/                   # Developer CLI (deploy, status, logs, exec)
+├── tests/                     # Unit, integration, and E2E tests
 └── examples/                  # Example configs and jobs
 ```
 
