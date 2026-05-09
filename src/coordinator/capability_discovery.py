@@ -1,8 +1,15 @@
 """
-Capability discovery using poll-based query/response pattern.
+Capability discovery supporting both poll-based and heartbeat-based discovery.
 
-Coordinator actively queries executors for capabilities.
-Executors respond on-demand with current state.
+Poll-based (legacy):
+  Coordinator actively queries executors for capabilities.
+  Executors respond on-demand with current state.
+  Blocking - waits for query timeout.
+
+Heartbeat-based (Phase 14):
+  Executors proactively send heartbeats every 30s.
+  Coordinator updates registry on each heartbeat.
+  Non-blocking - immediate updates.
 """
 import logging
 import threading
@@ -129,7 +136,7 @@ class ExecutorRegistry:
 
     def handle_capability_response(self, executor_id: str, response: Dict) -> None:
         """
-        Handle incoming capability response from executor.
+        Handle incoming capability response from executor (poll-based).
 
         Args:
             executor_id: ID of responding executor
@@ -146,6 +153,71 @@ class ExecutorRegistry:
                 logger.debug(f"Received capability response from {executor_id} (request_id={request_id})")
             else:
                 logger.debug(f"Received capability response for unknown/expired query: {request_id}")
+
+    def handle_heartbeat(self, executor_id: str, heartbeat: Dict) -> None:
+        """
+        Handle incoming heartbeat from executor (Phase 14: push-based).
+
+        Heartbeats directly update the registry without requiring a query.
+        This enables non-blocking executor discovery.
+
+        Args:
+            executor_id: ID of the executor sending heartbeat
+            heartbeat: Heartbeat message payload
+        """
+        now = time.time()
+
+        with self._lock:
+            # Update or create executor entry
+            self._executors[executor_id] = ExecutorInfo(
+                executor_id=executor_id,
+                hostname=heartbeat.get("hostname", "unknown"),
+                capabilities=heartbeat.get("capabilities", []),
+                capability_types=heartbeat.get("capability_types", []),
+                supported_formats=heartbeat.get("supported_formats", []),
+                last_seen=now,
+                last_query_id="heartbeat"  # Special marker for heartbeat-based updates
+            )
+
+            # Update last query time so is_stale() returns False
+            # This prevents blocking poll queries when heartbeats are active
+            self._last_query_time = now
+
+        caps_count = len(heartbeat.get("capabilities", []))
+        logger.debug(f"Heartbeat from {executor_id}: {caps_count} capabilities")
+
+    def prune_stale_executors(self, max_age: float = 90.0) -> int:
+        """
+        Remove executors that haven't sent heartbeats recently.
+
+        Should be called periodically (e.g., every 30s) to clean up
+        executors that have gone offline.
+
+        Args:
+            max_age: Maximum seconds since last heartbeat (default: 90s = miss 2-3 heartbeats)
+
+        Returns:
+            Number of executors removed
+        """
+        now = time.time()
+        removed = 0
+
+        with self._lock:
+            stale_ids = [
+                executor_id
+                for executor_id, info in self._executors.items()
+                if (now - info.last_seen) > max_age
+            ]
+
+            for executor_id in stale_ids:
+                del self._executors[executor_id]
+                removed += 1
+                logger.info(f"Removed stale executor: {executor_id}")
+
+        if removed > 0:
+            logger.info(f"Pruned {removed} stale executor(s)")
+
+        return removed
 
     def find_executor(self, job_id: str, job_version: str) -> Optional[str]:
         """

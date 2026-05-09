@@ -279,7 +279,7 @@ class MinioManager:
         self,
         bucket: str,
         prefix: str = "",
-        older_than_days: Optional[int] = None
+        older_than_days: Optional[float] = None
     ) -> List[Tuple[str, datetime, int]]:
         """
         List objects in bucket with optional filters.
@@ -343,11 +343,62 @@ class MinioManager:
                 f"Failed to delete s3://{bucket}/{object_name}: {e}"
             )
 
+    def copy_object(
+        self,
+        source_bucket: str,
+        source_object: str,
+        dest_bucket: str,
+        dest_object: str,
+    ) -> None:
+        """
+        Copy an object using server-side copy (no download/upload).
+
+        Phase 15: Used for efficient write-through from temp bucket to permanent
+        MinIO storage. The copy happens entirely server-side.
+
+        Args:
+            source_bucket: Source bucket name
+            source_object: Source object name
+            dest_bucket: Destination bucket name
+            dest_object: Destination object name
+
+        Raises:
+            MinioError: If copy fails
+        """
+        from minio.commonconfig import CopySource
+
+        try:
+            self.ensure_bucket(dest_bucket)
+
+            source = CopySource(source_bucket, source_object)
+
+            logger.debug(
+                f"Copying s3://{source_bucket}/{source_object} -> "
+                f"s3://{dest_bucket}/{dest_object}"
+            )
+
+            self.client.copy_object(
+                dest_bucket,
+                dest_object,
+                source,
+            )
+
+            logger.info(
+                f"Copied: s3://{source_bucket}/{source_object} -> "
+                f"s3://{dest_bucket}/{dest_object}"
+            )
+
+        except S3Error as e:
+            raise MinioError(
+                f"Failed to copy s3://{source_bucket}/{source_object} to "
+                f"s3://{dest_bucket}/{dest_object}: {e}"
+            )
+
     def cleanup_old_objects(
         self,
         bucket: str,
         prefix: str,
-        older_than_days: int,
+        older_than_days: float,
         dry_run: bool = False
     ) -> int:
         """
@@ -356,7 +407,7 @@ class MinioManager:
         Args:
             bucket: Bucket name
             prefix: Object name prefix
-            older_than_days: Delete objects older than N days
+            older_than_days: Delete objects older than N days (float for fractional days)
             dry_run: If True, only log what would be deleted
 
         Returns:
@@ -404,6 +455,45 @@ class MinioManager:
         except Exception as e:
             raise MinioError(f"Cleanup failed: {e}")
 
+    def cleanup_execution(self, bucket: str, tree_exec_id: str) -> int:
+        """
+        Clean up all objects for a specific tree execution.
+
+        Deletes all objects under jobs/{tree_exec_id}/ prefix.
+        Called after successful chain completion or failure.
+
+        Args:
+            bucket: Bucket name (typically temp_bucket)
+            tree_exec_id: Tree execution ID
+
+        Returns:
+            Number of objects deleted
+
+        Raises:
+            MinioError: If cleanup fails
+        """
+        prefix = f"jobs/{tree_exec_id}/"
+
+        try:
+            objects = list(self.client.list_objects(bucket, prefix=prefix, recursive=True))
+
+            if not objects:
+                logger.debug(f"No objects to clean up for {tree_exec_id}")
+                return 0
+
+            deleted = 0
+            for obj in objects:
+                self.client.remove_object(bucket, obj.object_name)
+                deleted += 1
+
+            logger.info(
+                f"Cleaned up {deleted} objects for execution {tree_exec_id}"
+            )
+            return deleted
+
+        except S3Error as e:
+            raise MinioError(f"Failed to cleanup execution {tree_exec_id}: {e}")
+
     def cleanup_orphaned_executions(
         self,
         bucket: str,
@@ -441,6 +531,29 @@ class MinioManager:
             older_than_days=older_than_days,
             dry_run=dry_run
         )
+
+    def object_exists(self, bucket: str, object_name: str) -> bool:
+        """
+        Check if an object exists in a bucket.
+
+        Phase 15: Used for cache-aware input preparation (check MinIO before
+        falling back to storage).
+
+        Args:
+            bucket: Bucket name
+            object_name: Object name
+
+        Returns:
+            True if object exists, False otherwise
+        """
+        try:
+            self.client.stat_object(bucket, object_name)
+            return True
+        except S3Error as e:
+            if e.code == "NoSuchKey":
+                return False
+            # Re-raise other errors
+            raise MinioError(f"Failed to check object existence: {e}")
 
     def test_connection(self) -> bool:
         """

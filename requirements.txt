@@ -1,7 +1,8 @@
 # LinearJC Coordinator Requirements
 
 # MQTT client
-paho-mqtt==1.6.1
+paho-mqtt==1.6.1  # Legacy (coordinator v1)
+aiomqtt>=2.3.0    # Async (coordinator v2)
 
 # YAML parsing
 PyYAML==6.0.1

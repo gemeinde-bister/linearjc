@@ -15,6 +15,7 @@ All messages are signed with HMAC-SHA256 and verified before processing.
 """
 import logging
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable, List, TYPE_CHECKING
@@ -583,38 +584,42 @@ class DeveloperAPI:
                 })
                 return
 
-            # Execute the tree
-            # Pass client_id to exec_callback so it can be stored in JobExecution
-            # BEFORE the MQTT publish - this prevents the race condition where
-            # progress updates arrive before tracking is established
-            try:
-                dev_client_id = client_id if follow else None
-                result = self.exec_callback(tree, dev_client_id)
-                tree_execution_id = result.get('tree_execution_id')
-                job_execution_id = result.get('job_execution_id')
+            # Execute the tree in a separate thread to avoid blocking MQTT
+            # The exec_callback calls query_capabilities() which blocks waiting
+            # for MQTT responses. If we run in the MQTT thread, we deadlock.
+            dev_client_id = client_id if follow else None
 
-                # Send accepted response
-                response = {
-                    'request_id': request_id,
-                    'status': 'accepted',
-                    'job_execution_id': job_execution_id,
-                    'tree_execution_id': tree_execution_id,
-                }
+            def run_exec():
+                try:
+                    result = self.exec_callback(tree, dev_client_id)
+                    tree_execution_id = result.get('tree_execution_id')
+                    job_execution_id = result.get('job_execution_id')
 
-                self._send_exec_response(client_id, response)
+                    # Send accepted response
+                    response = {
+                        'request_id': request_id,
+                        'status': 'accepted',
+                        'job_execution_id': job_execution_id,
+                        'tree_execution_id': tree_execution_id,
+                    }
 
-                logger.info(
-                    f"Exec accepted for {job_id}: "
-                    f"job_execution_id={job_execution_id}"
-                )
+                    self._send_exec_response(client_id, response)
 
-            except Exception as e:
-                logger.error(f"Exec failed for {job_id}: {e}")
-                self._send_exec_response(client_id, {
-                    'request_id': request_id,
-                    'status': 'error',
-                    'error': str(e)
-                })
+                    logger.info(
+                        f"Exec accepted for {job_id}: "
+                        f"job_execution_id={job_execution_id}"
+                    )
+
+                except Exception as e:
+                    logger.error(f"Exec failed for {job_id}: {e}")
+                    self._send_exec_response(client_id, {
+                        'request_id': request_id,
+                        'status': 'error',
+                        'error': str(e)
+                    })
+
+            exec_thread = threading.Thread(target=run_exec, daemon=True)
+            exec_thread.start()
 
         except MessageSigningError as e:
             logger.error(f"Message verification failed from {client_id}: {e}")
