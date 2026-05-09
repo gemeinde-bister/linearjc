@@ -929,7 +929,7 @@ fn download_and_install_job(
 /// replaces the current binary, and returns success (caller should exit).
 fn self_update(uri: &str, expected_checksum: &str, version: &str) -> Result<()> {
     use sha2::Digest;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     info!("Downloading executor v{} from {}", version, uri);
 
