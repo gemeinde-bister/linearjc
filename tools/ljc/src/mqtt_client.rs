@@ -34,8 +34,16 @@ pub struct Response {
 impl MqttClient {
     /// Create and connect to MQTT broker
     pub fn connect(config: Config) -> Result<Self> {
+        // Add unique suffix to client_id to prevent connection collisions
+        // when multiple ljc commands run in quick succession
+        let unique_client_id = format!(
+            "{}-{}",
+            config.mqtt.client_id,
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+
         let mut mqtt_options = MqttOptions::new(
-            config.mqtt.client_id.clone(),
+            unique_client_id,
             config.mqtt.broker.clone(),
             config.mqtt.port,
         );

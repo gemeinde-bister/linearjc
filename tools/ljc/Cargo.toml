@@ -1,6 +1,6 @@
 [package]
 name = "ljc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["LinearJC Team"]
 description = "LinearJC job development and deployment tool"
@@ -47,6 +47,9 @@ sha2 = "0.10.9"
 
 # HTTP client - for MinIO uploads (rustls for security)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+
+# Self-update - cross-platform binary self-replacement
+self-replace = "1.5"
 
 [dev-dependencies]
 tempfile = "3.15"

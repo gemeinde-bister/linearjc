@@ -16,3 +16,4 @@ pub mod status;
 pub mod ps;
 pub mod logs;
 pub mod kill;
+pub mod self_update;

@@ -226,6 +226,13 @@ enum Commands {
         #[arg(long)]
         wait: bool,
     },
+
+    /// Update ljc to latest version from coordinator
+    SelfUpdate {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -336,6 +343,9 @@ fn main() -> Result<()> {
         }
         Commands::Kill { execution_id, force, wait } => {
             commands::kill::run(&execution_id, force, wait)?;
+        }
+        Commands::SelfUpdate { check } => {
+            commands::self_update::run(check)?;
         }
     }
 
