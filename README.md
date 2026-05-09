@@ -1,24 +1,73 @@
 ## LinearJC
 
-A small, mainframe‑style job controller for linear workflows. It runs jobs in strict order, with clear auditability and simple operations. It is designed for environments that have enough capacity to meet daily targets without parallelizing every step.
+A small, mainframe-style batch controller for register-driven workflows. Jobs declare the named data registers they read and write; LinearJC validates ownership, protects shared data with locks, and runs batch work in a predictable order with clear auditability.
+
+The current implementation supports linear chains and fan-out. The project direction is to keep the user model register-driven, including future multi-input barrier jobs, instead of becoming a general DAG authoring platform.
 
 ### What it solves
-- Deterministic, in‑order execution for easy auditing and debugging.
+- Deterministic batch execution for easy auditing and debugging.
+- Explicit data contracts: jobs read and write named registers, not ad hoc paths.
+- Single-writer ownership for every managed data register.
 - Min/max executions per 24 hours using a sliding window (not cron).
 - Stateless executors with signed messaging and pre‑signed artifact transfers.
 - Simple single‑server or modest distributed setups without a heavy control plane.
 - Isolation where executors run inside KVM and can execute workloads in Docker inside those VMs.
 
-This is intentionally simpler than general DAG platforms (Airflow, Prefect, Dagu). If you need complex branching, backfills across multiple paths, or a rich UI, those tools may be a better fit. If you want predictable linear chains with low operational overhead, LinearJC is appropriate.
+This is intentionally simpler than general DAG platforms (Airflow, Prefect, Dagu). If you need complex branching, UI-driven workflow design, dynamic branching, or broad backfill machinery, those tools may be a better fit. If you want predictable batch flows with strong data ownership and low operational overhead, LinearJC is appropriate.
+
+### Mainframe mental model
+
+| Mainframe concept | LinearJC concept |
+|-------------------|------------------|
+| Cataloged dataset | Register |
+| Temporary dataset | Temp register |
+| Program or job step | Job module |
+| Job net / application | Batch group |
+| GDG generation | Batch generation |
+| ENQ / DEQ | Register lock |
+| JES spool | Execution archive |
+
+The important rule is data readiness, not graph drawing: a job is eligible when all input registers for the current batch generation are ready and all output registers can be exclusively locked.
 
 ### When to use it
-- Linear pipelines where each step must follow the previous.
+- Batch pipelines where outputs are named, owned, and audited.
+- Linear chains where each step must follow the previous.
+- Data consolidation flows where future barrier jobs should wait for multiple module outputs from the same batch generation.
 - Environments with guaranteed headroom to meet N..M runs per day without fine‑grained parallelism.
 - Teams prioritizing observability, security, and straightforward ops over maximum scheduling flexibility.
 
 ### When not to use it
-- Complex DAGs, backfills, or high fan‑out pipelines.
+- Arbitrary graph authoring, dynamic branching, or high fan-out workflow design.
+- Broad historical backfill machinery across many independent paths.
 - Full multi‑tenant workflows with interactive UIs and pluggable schedulers.
+
+## Multi-input barrier model
+
+Some batch work needs to generate data from the results of multiple other modules. The LinearJC direction is to express this through registers, not duplicated task dependencies.
+
+```yaml
+registry:
+  source_sales:       {type: fs, path: /data/source/sales.csv, kind: file, protect: true}
+  source_inventory:   {type: fs, path: /data/source/inventory.csv, kind: file, protect: true}
+  sales_extract:      {type: temp, kind: file}
+  inventory_extract:  {type: temp, kind: file}
+  daily_report:       {type: fs, path: /data/reports/daily.csv, kind: file}
+
+jobs:
+  - id: extract.sales
+    reads: [source_sales]
+    writes: [sales_extract]
+
+  - id: extract.inventory
+    reads: [source_inventory]
+    writes: [inventory_extract]
+
+  - id: build.report
+    reads: [sales_extract, inventory_extract]
+    writes: [daily_report]
+```
+
+In this model, `build.report` is a barrier job. It runs only after `sales_extract` and `inventory_extract` are both ready for the same batch generation. The implementation may use graph structures internally, but the user-facing contract remains: modules produce and consume named registers.
 
 ## Migrating from cron
 
@@ -67,7 +116,8 @@ Transport and data
 TLS for MQTT and MinIO is recommended for production. Example configs use development defaults; replace them before deployment.
 
 ## Status and scope
-- Scope: linear chains only. No general DAG semantics.
+- Current scope: linear chains and fan-out. No general DAG semantics.
+- Product direction: register-driven barrier jobs for multi-input consolidation, while avoiding arbitrary DAG authoring.
 - Archive format: tar.gz.
 - State: coordinator keeps scheduling state in memory; executor is stateless.
 - This repository includes examples and scripts for local evaluation and tests.
@@ -119,7 +169,7 @@ sudo cp examples/data_registry.yaml.sample /etc/linearjc/data_registry.yaml
 sudo cp -r examples/jobs /etc/linearjc/
 
 # Run coordinator
-python src/coordinator/main.py --config /etc/linearjc/config.yaml
+python src/coordinator_v2/main.py --config /etc/linearjc/config.yaml run
 ```
 
 Notes
@@ -164,7 +214,7 @@ Executors read environment variables:
 - `CAPABILITIES` - comma-separated capability types (e.g., `pool`)
 
 ## Limitations
-- Linear execution only; a single path per pipeline.
+- Current execution model is chain-oriented; multi-input barrier jobs are a planned register-driven extension.
 - No built‑in UI.
 - MQTT and MinIO are external dependencies.
 - Production deployments should enable TLS for MQTT and MinIO and provide strong secrets.

@@ -2,10 +2,10 @@
 
 ## Mental Model
 
-LinearJC follows a mainframe-style sequential processing model:
+LinearJC follows a mainframe-style register-driven batch model:
 
 ```
-Input Data → Job Script → Output Data → Next Job Script → ...
+Input Registers → Job Module → Output Registers → Downstream Modules
 ```
 
 **Key principle**: Write-once, read-many
@@ -13,7 +13,17 @@ Input Data → Job Script → Output Data → Next Job Script → ...
 - Multiple jobs can read from the same source
 - The data registry manages these named sources/sinks
 
-This is similar to JCL (Job Control Language) on mainframes, where COBOL programs processed sequential data sets in linear chains.
+This is similar to JCL (Job Control Language) on mainframes, where programs process named datasets and the scheduler protects dataset ownership. The important dependency is data readiness: a job can run when all of its input registers are ready for the current batch generation and its output registers can be locked.
+
+| Mainframe concept | LinearJC concept |
+|-------------------|------------------|
+| Cataloged dataset | Register |
+| Temporary dataset | Temp register |
+| Program / job step | Job module |
+| Job net / application | Batch group |
+| GDG generation | Batch generation |
+| ENQ / DEQ | Register lock |
+| JES spool | Execution archive |
 
 ## Job Script Requirements
 
@@ -59,26 +69,26 @@ Available in all job scripts:
 
 Create subdirectories matching your job definition output names:
 
-**For directory outputs (path_type: directory):**
+**For directory outputs (`kind: dir`):**
 ```bash
-# Job YAML defines: outputs: { website: website_build }
-# Registry defines: path_type: directory
+# Job YAML defines: writes: [website]
+# Registry defines: kind: dir
 mkdir -p "$LINEARJC_OUTPUT_DIR/website"
 echo "<html>..." > "$LINEARJC_OUTPUT_DIR/website/index.html"
 echo "body { }" > "$LINEARJC_OUTPUT_DIR/website/style.css"
 # Multiple files allowed
 ```
 
-**For single file outputs (path_type: file):**
+**For single file outputs (`kind: file`):**
 ```bash
-# Job YAML defines: outputs: { report: daily_report }
-# Registry defines: path_type: file
-mkdir -p "$LINEARJC_OUTPUT_DIR/report"
-echo "Date,Value" > "$LINEARJC_OUTPUT_DIR/report/report.csv"
+# Job YAML defines: writes: [daily_report]
+# Registry defines: kind: file
+mkdir -p "$LINEARJC_OUTPUT_DIR/daily_report"
+echo "Date,Value" > "$LINEARJC_OUTPUT_DIR/daily_report/report.csv"
 # Only ONE file in the directory - validated at extraction
 ```
 
-**Important:** The output subdirectory name must match the key in your job's `outputs:` section. The registry's `path_type` determines whether one or many files are allowed.
+**Important:** The output subdirectory name must match the register key in your job's `writes:` section. The registry's `kind` determines whether one or many files are allowed.
 
 ## Job Definition (Coordinator)
 
@@ -89,130 +99,256 @@ job:
   id: backup.daily
   version: "1.0.0"
 
-  # Linear dependencies (runs after these complete)
-  depends_on: []
+  # Registry references (Phase 15 format)
+  reads: [sensor_data, config]      # Input registers
+  writes: [backup_archive]          # Output registers
+
+  # Current linear-chain dependency field.
+  # Register reads/writes are the primary data contract.
+  depends: []
 
   # Schedule: min/max executions per 24h sliding window
   schedule:
     min_daily: 1    # At least once
     max_daily: 2    # At most twice
 
-  # Executor configuration
-  executor:
-    user: root      # User to run script as
-    timeout: 300    # Seconds (5 minutes)
-
-  # Data registry references
-  inputs:
-    source_data: raw_sensor_data
-
-  outputs:
-    archive: backup_storage
+  # Execution configuration
+  run:
+    user: backup           # User to run script as
+    timeout: 300           # Seconds (5 minutes)
+    entry: script.sh       # Entry script
+    isolation: strict      # strict | relaxed | none
+    network: true          # Allow network access
+    limits:                # Optional resource limits
+      cpu_percent: 50
+      memory_mb: 512
 ```
+
+**Key fields:**
+- `reads`: List of registry keys this job reads from
+- `writes`: List of registry keys this job writes to (must not be protected)
+- `depends`: Current chain predecessor field. Prefer `reads:`/`writes:` as the primary dependency contract; future barrier execution should infer multi-input waits from register ownership.
 
 ## Data Registry Pattern
 
 ### Write-Once, Read-Many
 
-The data registry (`data_registry.yaml`) defines named data locations with explicit type declarations:
+The data registry (`registry.yaml`) defines named data locations called **registers**. The Phase 15 register model supports three types:
 
-**Compact YAML format (recommended):**
+| Type | Storage | Persistence | Use Case |
+|------|---------|-------------|----------|
+| `fs` | Filesystem | Permanent | Managed outputs, external inputs |
+| `temp` | MinIO only | Chain duration | Intermediate data between jobs |
+| `minio` | MinIO bucket | Permanent | Large objects, cross-system sharing |
+
+**Registry Format:**
 ```yaml
 registry:
-  # Single file inputs/outputs
-  sensor_config: {type: filesystem, path_type: file, path: /data/sensors/config.json, readable: true, writable: false}
-  daily_report: {type: filesystem, path_type: file, path: /data/reports/daily.csv, readable: true, writable: true}
+  # External input (protected - cannot be written by jobs)
+  source_db: {type: fs, path: /data/source.db, kind: file, protect: true}
 
-  # Directory outputs (multiple files)
-  raw_sensor_data: {type: filesystem, path_type: directory, path: /data/sensors/live, readable: true, writable: false}
-  backup_storage: {type: filesystem, path_type: directory, path: /data/backups/daily, readable: true, writable: true}
+  # Managed outputs (written by jobs)
+  daily_report: {type: fs, path: /data/reports/daily.csv, kind: file}
+  backup_dir:   {type: fs, path: /data/backups/daily/, kind: dir}
 
-  # MinIO storage
-  intermediate_data: {type: minio, bucket: job-artifacts, prefix: temp/, retention_days: 7}
+  # Temporary (chain-only, MinIO storage)
+  intermediate: {type: temp, kind: file}
+
+  # MinIO permanent storage
+  large_data: {type: minio, bucket: job-artifacts, prefix: outputs/, kind: dir}
 ```
 
-**Path Types (required for filesystem entries):**
+### Register Types
 
-- **`path_type: file`** - Single file
+**`type: fs` - Filesystem Register**
+```yaml
+my_output: {type: fs, path: /absolute/path, kind: file|dir}
+my_input:  {type: fs, path: /absolute/path, kind: file|dir, protect: true}
+```
+
+- `path`: Absolute filesystem path (required)
+- `kind`: `file` (single file) or `dir` (directory)
+- `protect`: If `true`, register is read-only (external input that jobs cannot write to)
+
+Protected registers:
+- Must exist at coordinator startup (validated)
+- Jobs can read but cannot declare in `writes:`
+- Use for external data sources (databases, configs from other systems)
+
+**`type: temp` - Temporary Register**
+```yaml
+intermediate: {type: temp, kind: file|dir}
+```
+
+- No filesystem path - lives only in MinIO during chain execution
+- Automatically cleaned when tree completes or fails
+- Enables parallel fan-out (each tree gets unique MinIO path)
+- Use for data passed between chain jobs that doesn't need persistence
+
+**`type: minio` - MinIO Register**
+```yaml
+large_object: {type: minio, bucket: my-bucket, prefix: data/, kind: file|dir}
+```
+
+- `bucket`: MinIO bucket name (required, S3 naming rules)
+- `prefix`: Object prefix within bucket (optional)
+- `kind`: `file` or `dir`
+- Use for large objects or data accessed from multiple systems
+
+### Kind: file vs dir
+
+- **`kind: file`** - Single file
   - Archive must contain exactly one file
   - Validated at extraction time
-  - Example: CSV reports, JSON configs, single log files
+  - Example: CSV reports, JSON configs
 
-- **`path_type: directory`** - Directory with contents
+- **`kind: dir`** - Directory with contents
   - Archive can contain multiple files
   - Preserves directory structure
-  - Example: Website builds, multi-file datasets, log directories
+  - Example: Website builds, multi-file datasets
 
-**Design Philosophy:**
-Following mainframe JCL principles - explicitly declare what you're creating (like `DSORG=PS` vs `DSORG=PO`), and LinearJC validates it matches. No guessing from file extensions or runtime inspection.
+### Design Rules
 
-**Rules:**
-1. Each location has exactly ONE writer job
-2. Multiple jobs can read from the same location
-3. Jobs declare inputs/outputs by registry name, not filesystem paths
-4. Coordinator validates no two jobs write to the same location
-5. **Path type must match what job produces** (enforced at runtime)
+1. Each register has exactly ONE writer job (enforced)
+2. Multiple jobs can read from the same register
+3. Jobs declare `reads:/writes:` by registry name, not filesystem paths
+4. Protected registers (`protect: true`) cannot be written to
+5. Temp registers don't persist after chain completion
 
 ### Validation Errors
 
-LinearJC validates outputs match their declared `path_type`:
+**Error: Job writes to protected register**
+```
+SecurityError: Job 'my.job' cannot write to protected register 'source_db'
+Protected registers are external inputs (protect: true) that cannot be overwritten by jobs.
+```
+**Solution:** Use a different register for output, or remove `protect: true` if the job should manage this data.
+
+**Error: Protected register missing at startup**
+```
+SecurityError: Protected registers not found (protect: true must exist):
+  - source_db: /data/missing.db
+```
+**Solution:** Ensure the external data source exists before starting the coordinator.
 
 **Error: Multiple files when file expected**
 ```
-ArchiveError: Archive contains 3 items but path_type='file' requires exactly one file.
-Items: ['data.txt', 'summary.txt', 'log.txt']
+ArchiveError: Archive contains 3 items but kind='file' requires exactly one file.
 ```
-**Solution:** Change registry to `path_type: directory` or modify job to create single file.
+**Solution:** Change registry to `kind: dir` or modify job to create single file.
 
-**Error: Directory when file expected**
-```
-ArchiveError: Archive contains directory 'results' but path_type='file' requires a file
-```
-**Solution:** Job created subdirectory - flatten output or change to `path_type: directory`.
+### Locking (ENQ/DEQ)
 
-**Error: Empty archive**
-```
-ArchiveError: Archive is empty but path_type='file' requires one file
-```
-**Solution:** Job script didn't create output - fix job logic.
+The coordinator uses mainframe-style locking (Phase 15):
 
-### Locking (Advanced)
+- **Exclusive lock**: Acquired for `writes:` registers
+- **Shared lock**: Acquired for `reads:` registers (multiple readers allowed)
+- **Protected**: Always shared-only (no exclusive locks possible)
+- **Temp**: No locking (unique MinIO path per tree execution)
 
-For filesystem data sources, the coordinator tracks active writes:
-- Job A outputs to `backup_storage` → location locked
-- Job B tries to output to `backup_storage` → validation fails
-- Jobs complete → lock released
-
-This prevents concurrent writes to the same location.
+Lock acquisition is all-or-nothing: a tree gets all locks or waits in queue holding none. This prevents deadlock and ensures fair scheduling.
 
 ## Example: Linear Chain
 
 **Scenario**: Sensor data → Daily compaction → Weekly rollup → Archive
 
 ```yaml
-# Job 1: compact.daily
-depends_on: []
-inputs:
-  live: sensor_live_data
-outputs:
-  daily: sensor_daily_data
+# Registry
+registry:
+  sensor_live: {type: fs, path: /data/sensors/live, kind: dir, protect: true}
+  daily_data:  {type: temp, kind: file}  # Intermediate - no persistence needed
+  weekly_data: {type: temp, kind: file}  # Intermediate
+  archive:     {type: fs, path: /data/archive/sensors.tar.gz, kind: file}
 
-# Job 2: compact.weekly
-depends_on: [compact.daily]
-inputs:
-  daily: sensor_daily_data
-outputs:
-  weekly: sensor_weekly_data
+# Job 1: compact.daily (chain root)
+job:
+  id: compact.daily
+  version: "1.0.0"
+  reads: [sensor_live]
+  writes: [daily_data]
+  depends: []
+  schedule: {min_daily: 1, max_daily: 1}
+  run: {user: sensor, timeout: 600}
 
-# Job 3: archive
-depends_on: [compact.weekly]
-inputs:
-  weekly: sensor_weekly_data
-outputs:
-  archive: long_term_storage
+# Job 2: compact.weekly (chain middle)
+job:
+  id: compact.weekly
+  version: "1.0.0"
+  reads: [daily_data]
+  writes: [weekly_data]
+  depends: [compact.daily]
+  schedule: {min_daily: 1, max_daily: 1}
+  run: {user: sensor, timeout: 1200}
+
+# Job 3: archive (chain leaf)
+job:
+  id: archive.sensors
+  version: "1.0.0"
+  reads: [weekly_data]
+  writes: [archive]
+  depends: [compact.weekly]
+  schedule: {min_daily: 1, max_daily: 1}
+  run: {user: sensor, timeout: 600}
 ```
 
-Execution order: 1 → 2 → 3 (sequential, deterministic)
+**Execution flow**:
+1. `compact.daily` reads protected `sensor_live`, writes to temp `daily_data`
+2. `compact.weekly` reads temp `daily_data` (cache hit from MinIO), writes to temp `weekly_data`
+3. `archive.sensors` reads temp `weekly_data`, writes to permanent `archive` (write-through to filesystem)
+4. Tree completes → temp data cleaned from MinIO
+
+## Example: Multi-Input Barrier Job (Planned)
+
+**Scenario**: Two extraction modules produce temporary results. A report module waits until both results exist for the same batch generation.
+
+```yaml
+# Registry
+registry:
+  source_sales:      {type: fs, path: /data/source/sales.csv, kind: file, protect: true}
+  source_inventory:  {type: fs, path: /data/source/inventory.csv, kind: file, protect: true}
+  sales_extract:     {type: temp, kind: file}
+  inventory_extract: {type: temp, kind: file}
+  daily_report:      {type: fs, path: /data/reports/daily.csv, kind: file}
+
+# Job 1: extract.sales
+job:
+  id: extract.sales
+  version: "1.0.0"
+  reads: [source_sales]
+  writes: [sales_extract]
+  depends: []
+  schedule: {min_daily: 1, max_daily: 1}
+  run: {user: batch, timeout: 300}
+
+# Job 2: extract.inventory
+job:
+  id: extract.inventory
+  version: "1.0.0"
+  reads: [source_inventory]
+  writes: [inventory_extract]
+  depends: []
+  schedule: {min_daily: 1, max_daily: 1}
+  run: {user: batch, timeout: 300}
+
+# Job 3: build.report
+job:
+  id: build.report
+  version: "1.0.0"
+  reads: [sales_extract, inventory_extract]
+  writes: [daily_report]
+  # Future barrier mode should infer this wait from reads/writes.
+  depends: []
+  schedule: {min_daily: 1, max_daily: 1}
+  run: {user: batch, timeout: 600}
+```
+
+**Execution flow**:
+1. `extract.sales` writes `sales_extract` for generation `daily.close-...`
+2. `extract.inventory` writes `inventory_extract` for the same generation
+3. `build.report` becomes eligible only after both temp registers are ready
+4. `daily_report` is locked exclusively and committed as the durable output
+
+This is a barrier, not a free-form workflow graph. Users declare module inputs and outputs; the controller derives the wait from register ownership.
 
 ## Docker-Based Jobs
 
@@ -293,28 +429,32 @@ exit 0
 3. **Idempotent**: Jobs should produce same output given same input
 4. **Logging**: Write to stdout/stderr (captured in executor logs)
 5. **Cleanup**: Remove temp files on failure (or rely on executor cleanup)
-6. **Choose correct path_type**:
+6. **Choose correct `kind`**:
    - Use `file` for single-file outputs (CSVs, JSON, single logs)
-   - Use `directory` for multi-file outputs (websites, datasets, archives)
+   - Use `dir` for multi-file outputs (websites, datasets, archives)
    - Declare explicitly - don't rely on naming conventions
-7. **Registry as contract**: Treat data registry as the contract between jobs - if you change path_type, dependent jobs may break
+7. **Registry as contract**: Treat data registry as the contract between jobs - if you change `kind`, dependent jobs may break
 
 ## When NOT to Use LinearJC
 
-- Complex DAGs with branching/merging
+- Arbitrary DAG authoring or UI-driven workflow design
 - Dynamic workflows (runtime-determined steps)
-- High fan-out parallelism
 - Interactive workflows with approvals
+- Sub-second scheduling requirements
 
 Use Airflow/Prefect/Dagu for these cases.
+
+**Note**: Fan-out is supported (one job → multiple parallel chains via temp registers). Multi-input barrier jobs are planned as a register-driven extension, not as a shift toward general DAG orchestration.
 
 ## When to Use LinearJC
 
 - ETL pipelines (extract → transform → load)
 - Data compaction chains
 - Sequential report generation
+- Multi-module batch consolidation where outputs are joined by register readiness
 - Backup workflows
 - Cron job replacement with dependencies
 - Low operational overhead requirements
+- Single-coordinator deployments
 
-LinearJC trades scheduling flexibility for operational simplicity.
+LinearJC trades scheduling flexibility for operational simplicity and a small external service set.
