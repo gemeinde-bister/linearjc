@@ -15,7 +15,7 @@ use nix::unistd::{getuid, Pid, Uid, User};
 use rumqttc::{Client, Event, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{mpsc, LazyLock, Mutex};
 use std::{collections::HashMap, env, fs, path::PathBuf, time::Duration};
 
 // Thread-safe tracking of active job PIDs for cancellation support
@@ -207,6 +207,22 @@ fn validate_job_request(req: &JobRequest) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Get the target platform string for this binary.
+/// Used for heartbeat messages and self-update requests.
+fn target_platform() -> &'static str {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    { "x86_64-unknown-linux-musl" }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    { "aarch64-unknown-linux-musl" }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "linux")
+    )))]
+    { "unknown-unknown-unknown" }
 }
 
 /// Get UID for a given username (already validated)
@@ -505,14 +521,29 @@ fn execute_job(
     } else if let Some(code) = execution_result.exit_code {
         error!("tree_exec={} job_exec={} executor={} duration_ms={} exit_code={} Job script failed",
                tree_exec, job_exec, executor_id, job_duration_ms, code);
+        // Cleanup work directory before returning error
+        if let Err(e) = job_work.cleanup() {
+            warn!("tree_exec={} job_exec={} executor={} Failed to cleanup work directory: {}",
+                  tree_exec, job_exec, executor_id, e);
+        }
         anyhow::bail!("Job script failed with exit code {}", code);
     } else if let Some(signal) = execution_result.signal {
         error!("tree_exec={} job_exec={} executor={} signal={} Job script killed by signal",
                tree_exec, job_exec, executor_id, signal);
+        // Cleanup work directory before returning error
+        if let Err(e) = job_work.cleanup() {
+            warn!("tree_exec={} job_exec={} executor={} Failed to cleanup work directory: {}",
+                  tree_exec, job_exec, executor_id, e);
+        }
         anyhow::bail!("Job script killed by signal {}", signal);
     } else {
         error!("tree_exec={} job_exec={} executor={} Job script terminated unexpectedly",
                tree_exec, job_exec, executor_id);
+        // Cleanup work directory before returning error
+        if let Err(e) = job_work.cleanup() {
+            warn!("tree_exec={} job_exec={} executor={} Failed to cleanup work directory: {}",
+                  tree_exec, job_exec, executor_id, e);
+        }
         anyhow::bail!("Job script terminated unexpectedly: {:?}", execution_result.error);
     }
 
@@ -550,6 +581,16 @@ fn execute_job(
         let duration_ms = start.elapsed().as_millis();
         info!("tree_exec={} job_exec={} executor={} output={} bytes={} duration_ms={} Output uploaded",
               tree_exec, job_exec, executor_id, name, size, duration_ms);
+    }
+
+    // Cleanup work directory after successful completion
+    // Outputs have been uploaded, work directory no longer needed
+    if let Err(e) = job_work.cleanup() {
+        warn!("tree_exec={} job_exec={} executor={} Failed to cleanup work directory: {}",
+              tree_exec, job_exec, executor_id, e);
+    } else {
+        info!("tree_exec={} job_exec={} executor={} Work directory cleaned up",
+              tree_exec, job_exec, executor_id);
     }
 
     Ok(())
@@ -725,6 +766,65 @@ fn discover_capabilities(jobs_dir: &Path, _allowed_extensions: &[String]) -> Res
     Ok(capabilities)
 }
 
+/// Publish a heartbeat message to the coordinator.
+/// Heartbeats are sent periodically (every 30s) and on coordinator startup.
+/// This replaces the poll-based capability discovery with a push model.
+fn publish_heartbeat(
+    client: &mut Client,
+    executor_id: &str,
+    hostname: &str,
+    jobs_dir: &Path,
+    allowed_extensions: &[String],
+    shared_secret: &str,
+) {
+    // Discover current capabilities from installed packages
+    let capabilities = match discover_capabilities(jobs_dir, allowed_extensions) {
+        Ok(caps) => caps,
+        Err(e) => {
+            error!("Failed to discover capabilities for heartbeat: {}", e);
+            Vec::new()
+        }
+    };
+
+    // Get capability types from environment
+    let capability_types: Vec<String> = env::var("CAPABILITIES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Build heartbeat message (matches proposal spec)
+    // Include executor version and platform for auto-update support
+    let heartbeat = serde_json::json!({
+        "executor_id": executor_id,
+        "hostname": hostname,
+        "executor_version": env!("CARGO_PKG_VERSION"),
+        "platform": target_platform(),
+        "capability_types": capability_types,
+        "capabilities": capabilities,
+        "supported_formats": ["tar.gz"]
+    });
+
+    // Sign and publish
+    match sign_message(heartbeat, shared_secret) {
+        Ok(signed) => {
+            match serde_json::to_string(&signed) {
+                Ok(json) => {
+                    let topic = format!("linearjc/heartbeat/{}", executor_id);
+                    if let Err(e) = client.publish(&topic, QoS::AtLeastOnce, false, json) {
+                        error!("Failed to publish heartbeat: {}", e);
+                    } else {
+                        debug!("Published heartbeat ({} capabilities)", capabilities.len());
+                    }
+                }
+                Err(e) => error!("Failed to serialize heartbeat: {}", e),
+            }
+        }
+        Err(e) => error!("Failed to sign heartbeat: {}", e),
+    }
+}
+
 fn download_and_install_job(
     job_id: &str,
     version: &str,
@@ -823,6 +923,87 @@ fn download_and_install_job(
     Ok(())
 }
 
+/// Self-update the executor binary.
+///
+/// Downloads the new binary from the coordinator, verifies the checksum,
+/// replaces the current binary, and returns success (caller should exit).
+fn self_update(uri: &str, expected_checksum: &str, version: &str) -> Result<()> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+
+    info!("Downloading executor v{} from {}", version, uri);
+
+    // Get current executable path
+    let current_exe = std::env::current_exe()
+        .context("Failed to determine current executable path")?;
+
+    // Download to temp file in same directory (for atomic rename)
+    let temp_path = current_exe.with_extension("new");
+    let backup_path = current_exe.with_extension("backup");
+
+    // Download the binary
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .context("Failed to create HTTP client")?
+        .get(uri)
+        .send()
+        .context("Failed to download binary")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Download failed with status: {}", response.status());
+    }
+
+    let bytes = response.bytes()
+        .context("Failed to read response body")?;
+
+    // Compute checksum
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    let actual_checksum = format!("{:x}", hasher.finalize());
+
+    if actual_checksum != expected_checksum {
+        anyhow::bail!(
+            "Checksum mismatch: expected {}, got {}",
+            expected_checksum, actual_checksum
+        );
+    }
+
+    info!("Checksum verified, installing...");
+
+    // Write to temp file
+    {
+        let mut file = fs::File::create(&temp_path)
+            .context("Failed to create temp file")?;
+        file.write_all(&bytes)
+            .context("Failed to write temp file")?;
+    }
+
+    // Set executable permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755))
+            .context("Failed to set executable permissions")?;
+    }
+
+    // Backup current binary
+    if current_exe.exists() {
+        // Remove old backup if exists
+        let _ = fs::remove_file(&backup_path);
+        fs::rename(&current_exe, &backup_path)
+            .context("Failed to backup current binary")?;
+    }
+
+    // Move new binary to current location
+    fs::rename(&temp_path, &current_exe)
+        .context("Failed to replace binary")?;
+
+    info!("✓ Updated executor to v{}", version);
+
+    Ok(())
+}
+
 fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_extensions: &[String]) -> Result<()> {
     let broker = env::var("MQTT_BROKER").unwrap_or_else(|_| "localhost".into());
     let port: u16 = env::var("MQTT_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(1883);
@@ -843,67 +1024,60 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_
         .or_else(|_| env::var("HOST"))
         .unwrap_or_else(|_| "unknown".to_string());
 
+    // Channel for triggering immediate heartbeats (coordinator/online)
+    let (heartbeat_tx, heartbeat_rx) = mpsc::channel::<()>();
+
+    // Spawn heartbeat thread - publishes every 30s or when triggered
+    {
+        let mut heartbeat_client = client.clone();
+        let heartbeat_executor_id = executor_id.to_string();
+        let heartbeat_hostname = hostname.clone();
+        let heartbeat_jobs_dir = jobs_dir.clone();
+        let heartbeat_extensions = allowed_extensions.to_vec();
+        let heartbeat_secret = shared_secret.clone();
+
+        std::thread::spawn(move || {
+            info!("Heartbeat thread started (interval: 30s)");
+
+            // Add small jitter to prevent thundering herd (0-5s)
+            let jitter = Duration::from_millis((std::process::id() % 5000) as u64);
+            std::thread::sleep(jitter);
+
+            loop {
+                // Wait for trigger or timeout (30s)
+                match heartbeat_rx.recv_timeout(Duration::from_secs(30)) {
+                    Ok(()) => {
+                        // Triggered by coordinator/online - immediate heartbeat
+                        info!("Coordinator online - sending immediate heartbeat");
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Normal periodic heartbeat
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // Channel closed - main thread exiting
+                        info!("Heartbeat thread stopping (channel closed)");
+                        break;
+                    }
+                }
+
+                publish_heartbeat(
+                    &mut heartbeat_client,
+                    &heartbeat_executor_id,
+                    &heartbeat_hostname,
+                    &heartbeat_jobs_dir,
+                    &heartbeat_extensions,
+                    &heartbeat_secret,
+                );
+            }
+        });
+    }
+
     // Event loop with reconnection handling
     for notification in connection.iter() {
         match notification {
             Ok(Event::Incoming(Packet::Publish(p))) => {
-                // Handle capability query
-                if p.topic == "linearjc/query/capabilities" {
-                    // Verify and parse query
-                    match serde_json::from_slice::<serde_json::Value>(&p.payload) {
-                        Ok(envelope) => {
-                            match verify_message(&envelope, &shared_secret, 60) {
-                                Ok(payload) => {
-                                    let request_id = payload.get("request_id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
-
-                                    info!("Received capability query (request_id={})", request_id);
-
-                                    // Discover capabilities dynamically from jobs directory
-                                    let capabilities = match discover_capabilities(jobs_dir, allowed_extensions) {
-                                        Ok(caps) => caps,
-                                        Err(e) => {
-                                            error!("Failed to discover capabilities: {}", e);
-                                            Vec::new() // Return empty list on error
-                                        }
-                                    };
-
-                                    // Get capability types from environment
-                                    let capability_types: Vec<String> = env::var("CAPABILITIES")
-                                        .unwrap_or_default()
-                                        .split(',')
-                                        .map(|s| s.trim().to_string())
-                                        .filter(|s| !s.is_empty())
-                                        .collect();
-
-                                    // Build capability response
-                                    let capability = serde_json::json!({
-                                        "request_id": request_id,
-                                        "executor_id": executor_id,
-                                        "hostname": hostname,
-                                        "capabilities": capabilities,
-                                        "capability_types": capability_types,
-                                        "supported_formats": ["tar.gz"]
-                                    });
-
-                                    // Sign and publish response
-                                    if let Ok(signed) = sign_message(capability, &shared_secret) {
-                                        if let Ok(json) = serde_json::to_string(&signed) {
-                                            let topic = format!("linearjc/capabilities/{}", executor_id);
-                                            let _ = client.publish(topic, QoS::AtLeastOnce, false, json);
-                                            info!("Sent capability response (request_id={})", request_id);
-                                        }
-                                    }
-                                }
-                                Err(e) => error!("Query verification failed: {}", e)
-                            }
-                        }
-                        Err(e) => error!("Invalid query JSON: {}", e)
-                    }
-                }
                 // Handle job request
-                else if p.topic.starts_with("linearjc/jobs/requests/") {
+                if p.topic.starts_with("linearjc/jobs/requests/") {
                     // Parse envelope
                     match serde_json::from_slice::<serde_json::Value>(&p.payload) {
                         Ok(envelope) => {
@@ -1083,14 +1257,72 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_
                         Err(e) => error!("Invalid cancel JSON: {}", e)
                     }
                 }
+                // Handle executor self-update command
+                else if p.topic.contains("/update") {
+                    match serde_json::from_slice::<serde_json::Value>(&p.payload) {
+                        Ok(envelope) => {
+                            match verify_message(&envelope, &shared_secret, 60) {
+                                Ok(payload) => {
+                                    let version = payload.get("version")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown");
+                                    let uri = payload.get("uri")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let checksum = payload.get("checksum_sha256")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+
+                                    if uri.is_empty() || checksum.is_empty() {
+                                        error!("Invalid update payload: missing uri or checksum");
+                                        continue;
+                                    }
+
+                                    let current_version = env!("CARGO_PKG_VERSION");
+                                    info!(
+                                        "Executor update command received: {} -> {}",
+                                        current_version, version
+                                    );
+
+                                    // Perform self-update
+                                    match self_update(uri, checksum, version) {
+                                        Ok(_) => {
+                                            info!("Self-update successful, restarting...");
+                                            // Exit cleanly - init system will restart us
+                                            std::process::exit(0);
+                                        }
+                                        Err(e) => {
+                                            error!("Self-update failed: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => error!("Update verification failed: {}", e)
+                            }
+                        }
+                        Err(e) => error!("Invalid update JSON: {}", e)
+                    }
+                }
+                // Handle coordinator online announcement - trigger immediate heartbeat
+                else if p.topic == "linearjc/coordinator/online" {
+                    match serde_json::from_slice::<serde_json::Value>(&p.payload) {
+                        Ok(envelope) => {
+                            match verify_message(&envelope, &shared_secret, 60) {
+                                Ok(_payload) => {
+                                    info!("Coordinator online announcement received");
+                                    // Trigger immediate heartbeat
+                                    let _ = heartbeat_tx.send(());
+                                }
+                                Err(e) => error!("Coordinator online verification failed: {}", e)
+                            }
+                        }
+                        Err(e) => error!("Invalid coordinator online JSON: {}", e)
+                    }
+                }
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 info!("Connected to MQTT broker");
 
                 // Re-subscribe after reconnection
-                if let Err(e) = client.subscribe("linearjc/query/capabilities", QoS::AtLeastOnce) {
-                    error!("Failed to subscribe to queries: {}", e);
-                }
                 if let Err(e) = client.subscribe("linearjc/jobs/requests/+", QoS::AtLeastOnce) {
                     error!("Failed to subscribe to job requests: {}", e);
                 }
@@ -1102,8 +1334,20 @@ fn mqtt_loop(executor_id: &str, jobs_dir: &PathBuf, work_dir: &PathBuf, allowed_
                 if let Err(e) = client.subscribe(&cancel_topic, QoS::AtLeastOnce) {
                     error!("Failed to subscribe to cancel requests: {}", e);
                 }
+                // Subscribe to self-update commands for this executor
+                let update_topic = format!("linearjc/executors/{}/update", executor_id);
+                if let Err(e) = client.subscribe(&update_topic, QoS::AtLeastOnce) {
+                    error!("Failed to subscribe to update topic: {}", e);
+                }
+                // Subscribe to coordinator online announcements (triggers immediate heartbeat)
+                if let Err(e) = client.subscribe("linearjc/coordinator/online", QoS::AtLeastOnce) {
+                    error!("Failed to subscribe to coordinator/online: {}", e);
+                }
 
                 info!("Resubscribed to topics");
+
+                // Send immediate heartbeat on connection
+                let _ = heartbeat_tx.send(());
             }
             Ok(Event::Outgoing(_)) => {
                 // Outgoing events - ignore
