@@ -1,7 +1,8 @@
-"""Unit tests for LinearJC coordinator models (SPEC.md v0.5.0 format)."""
+"""Unit tests for LinearJC coordinator models (SPEC.md v0.8.0 format)."""
 import pytest
 import sys
 from pathlib import Path
+from pydantic import ValidationError
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
@@ -194,7 +195,11 @@ job:
 
 
 class TestDataRegistryEntry:
-    """Tests for DataRegistryEntry model (SPEC.md v0.5.0 format)."""
+    """Tests for DataRegistryEntry model (SPEC.md v0.8.0 Phase 15 format)."""
+
+    # ─────────────────────────────────────────────────────────────────────
+    # type: fs - Filesystem registers
+    # ─────────────────────────────────────────────────────────────────────
 
     def test_filesystem_entry(self):
         """Parse fs type registry entry."""
@@ -206,6 +211,7 @@ class TestDataRegistryEntry:
         assert entry.type == "fs"
         assert entry.path == "/var/data/input.txt"
         assert entry.kind == "file"
+        assert entry.protect is False  # Default
 
     def test_filesystem_dir(self):
         """Parse fs type directory entry."""
@@ -217,41 +223,145 @@ class TestDataRegistryEntry:
         assert entry.type == "fs"
         assert entry.kind == "dir"
 
+    def test_filesystem_protected(self):
+        """Parse fs type with protect=True (external input)."""
+        entry = DataRegistryEntry(
+            type="fs",
+            path="/var/data/external.db",
+            kind="file",
+            protect=True
+        )
+        assert entry.type == "fs"
+        assert entry.protect is True
+
+    def test_filesystem_requires_path(self):
+        """fs type requires path."""
+        with pytest.raises(ValidationError, match="path required for type: fs"):
+            DataRegistryEntry(type="fs", kind="file")
+
+    def test_filesystem_cannot_have_bucket(self):
+        """fs type cannot have bucket."""
+        with pytest.raises(ValidationError, match="bucket not allowed for type: fs"):
+            DataRegistryEntry(type="fs", path="/data/file", kind="file", bucket="test")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # type: temp - Temporary registers (MinIO only)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def test_temp_entry(self):
+        """Parse temp type registry entry."""
+        entry = DataRegistryEntry(type="temp", kind="file")
+        assert entry.type == "temp"
+        assert entry.kind == "file"
+        assert entry.path is None
+        assert entry.bucket is None
+
+    def test_temp_dir(self):
+        """Parse temp type directory entry."""
+        entry = DataRegistryEntry(type="temp", kind="dir")
+        assert entry.type == "temp"
+        assert entry.kind == "dir"
+
+    def test_temp_cannot_have_path(self):
+        """temp type cannot have path."""
+        with pytest.raises(ValidationError, match="path not allowed for type: temp"):
+            DataRegistryEntry(type="temp", kind="file", path="/data/temp")
+
+    def test_temp_cannot_have_bucket(self):
+        """temp type cannot have bucket."""
+        with pytest.raises(ValidationError, match="bucket not allowed for type: temp"):
+            DataRegistryEntry(type="temp", kind="file", bucket="test")
+
+    def test_temp_cannot_have_protect(self):
+        """temp type cannot have protect."""
+        with pytest.raises(ValidationError, match="protect not allowed for type: temp"):
+            DataRegistryEntry(type="temp", kind="file", protect=True)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # type: minio - Permanent MinIO registers
+    # ─────────────────────────────────────────────────────────────────────
+
     def test_minio_entry(self):
         """Parse minio type registry entry."""
         entry = DataRegistryEntry(
             type="minio",
             bucket="artifacts",
-            prefix="jobs/output/"
+            prefix="jobs/output/",
+            kind="file"
         )
         assert entry.type == "minio"
         assert entry.bucket == "artifacts"
         assert entry.prefix == "jobs/output/"
+        assert entry.kind == "file"
+
+    def test_minio_requires_bucket(self):
+        """minio type requires bucket."""
+        with pytest.raises(ValidationError, match="bucket required for type: minio"):
+            DataRegistryEntry(type="minio", kind="file")
+
+    def test_minio_cannot_have_path(self):
+        """minio type cannot have path."""
+        with pytest.raises(ValidationError, match="path not allowed for type: minio"):
+            DataRegistryEntry(type="minio", bucket="test", kind="file", path="/data")
+
+    def test_minio_cannot_have_protect(self):
+        """minio type cannot have protect."""
+        with pytest.raises(ValidationError, match="protect not supported for type: minio"):
+            DataRegistryEntry(type="minio", bucket="test", kind="file", protect=True)
+
+    def test_minio_bucket_validation(self):
+        """minio bucket must follow S3 naming rules."""
+        # Valid bucket names
+        DataRegistryEntry(type="minio", bucket="my-bucket", kind="file")
+        DataRegistryEntry(type="minio", bucket="my.bucket.name", kind="file")
+
+        # Invalid: uppercase
+        with pytest.raises(ValidationError, match="Invalid bucket name"):
+            DataRegistryEntry(type="minio", bucket="MyBucket", kind="file")
+
+        # Invalid: too short
+        with pytest.raises(ValidationError, match="Invalid bucket name"):
+            DataRegistryEntry(type="minio", bucket="ab", kind="file")
+
+    def test_minio_prefix_no_traversal(self):
+        """minio prefix cannot contain path traversal."""
+        with pytest.raises(ValidationError, match="Path traversal in prefix"):
+            DataRegistryEntry(type="minio", bucket="test", prefix="../escape", kind="file")
+
+    def test_minio_prefix_no_leading_slash(self):
+        """minio prefix cannot start with /."""
+        with pytest.raises(ValidationError, match="Prefix must not start with"):
+            DataRegistryEntry(type="minio", bucket="test", prefix="/absolute", kind="file")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # General validation
+    # ─────────────────────────────────────────────────────────────────────
 
     def test_invalid_type(self):
         """Invalid type raises error."""
-        with pytest.raises(ValueError, match="Invalid type"):
-            DataRegistryEntry(type="s3", path="/data")
+        with pytest.raises(ValidationError, match="'fs', 'temp' or 'minio'"):
+            DataRegistryEntry(type="s3", kind="file")
 
     def test_invalid_kind(self):
         """Invalid kind raises error."""
-        with pytest.raises(ValueError, match="kind must be"):
+        with pytest.raises(ValidationError, match="'file' or 'dir'"):
             DataRegistryEntry(type="fs", path="/data", kind="folder")
 
-    def test_kind_only_for_fs(self):
-        """kind only valid for fs type."""
-        with pytest.raises(ValueError, match="kind only valid for fs type"):
-            DataRegistryEntry(type="minio", bucket="test", kind="file")
+    def test_kind_required(self):
+        """kind is required for all types."""
+        with pytest.raises(ValidationError, match="Field required"):
+            DataRegistryEntry(type="fs", path="/data")
 
     def test_parse_compact_yaml(self):
-        """Parse compact YAML format from SPEC.md."""
+        """Parse compact YAML format from Phase 15 spec."""
         import yaml
 
         yaml_content = """
 registry:
   sensor_raw:     {type: fs, path: /var/share/sensors/raw, kind: dir}
-  sensor_config:  {type: fs, path: /var/share/sensors/config.json, kind: file}
-  sensor_parsed:  {type: minio, bucket: linearjc, prefix: intermediate/parsed/}
+  sensor_config:  {type: fs, path: /var/share/sensors/config.json, kind: file, protect: true}
+  intermediate:   {type: temp, kind: file}
+  sensor_parsed:  {type: minio, bucket: linearjc, prefix: intermediate/parsed/, kind: dir}
 """
         data = yaml.safe_load(yaml_content)
 
@@ -259,14 +369,21 @@ registry:
         raw = DataRegistryEntry(**data['registry']['sensor_raw'])
         assert raw.type == "fs"
         assert raw.kind == "dir"
+        assert raw.protect is False
 
         config = DataRegistryEntry(**data['registry']['sensor_config'])
         assert config.type == "fs"
         assert config.kind == "file"
+        assert config.protect is True
+
+        intermediate = DataRegistryEntry(**data['registry']['intermediate'])
+        assert intermediate.type == "temp"
+        assert intermediate.kind == "file"
 
         parsed = DataRegistryEntry(**data['registry']['sensor_parsed'])
         assert parsed.type == "minio"
         assert parsed.bucket == "linearjc"
+        assert parsed.kind == "dir"
 
 
 class TestJobSchedule:

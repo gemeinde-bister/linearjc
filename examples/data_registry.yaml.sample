@@ -3,31 +3,37 @@
 # Copy to /etc/linearjc/data_registry.yaml or another location and adjust paths.
 #
 # Format (compact YAML for better grep-ability):
-#   name: {type: filesystem, path_type: file|directory, path: /path, readable: bool, writable: bool}
-#   name: {type: minio, bucket: bucket-name, prefix: prefix/, retention_days: N}
+#   name: {type: fs, path: /path, kind: file|dir, protect: bool}
+#   name: {type: temp, kind: file|dir}
+#   name: {type: minio, bucket: bucket-name, prefix: prefix/, kind: file|dir}
 #
-# Path Type:
+# Register kind:
 #   - file: Single file (validates archive contains exactly one file)
-#   - directory: Directory with contents (extracts full structure)
+#   - dir: Directory with contents (extracts full structure)
+#
+# protect: true marks an external input as read-only for jobs.
 #
 # Following mainframe philosophy: explicit > implicit
 # Declare what you're creating, and LinearJC validates it matches.
 
 registry:
-  # Input: Single text file
-  hello_input: {type: filesystem, path_type: file, path: /tmp/linearjc/data/hello_input.txt, readable: true, writable: true}
+  # Input: Single external text file
+  hello_input: {type: fs, path: /tmp/linearjc/data/hello_input.txt, kind: file, protect: true}
 
   # Output: Directory containing job results (hello.world creates multiple files)
-  hello_output: {type: filesystem, path_type: directory, path: /tmp/linearjc/data/hello_output, readable: true, writable: true}
+  hello_output: {type: fs, path: /tmp/linearjc/data/hello_output, kind: dir}
 
   # Output: Directory for followup job results
-  followup_output: {type: filesystem, path_type: directory, path: /tmp/linearjc/data/followup_output, readable: true, writable: true}
+  followup_output: {type: fs, path: /tmp/linearjc/data/followup_output, kind: dir}
 
-  # Example: MinIO storage for intermediate data
-  # intermediate_data: {type: minio, bucket: job-artifacts, prefix: hello/intermediate/, retention_days: 7}
+  # Example: Chain-local temporary data
+  # intermediate_data: {type: temp, kind: file}
+
+  # Example: Permanent MinIO storage
+  # permanent_artifact: {type: minio, bucket: job-artifacts, prefix: hello/artifacts/, kind: dir}
 
   # Example: Single file output (if job creates exactly one file)
-  # report_csv: {type: filesystem, path_type: file, path: /tmp/linearjc/data/daily_report.csv, readable: true, writable: true}
+  # report_csv: {type: fs, path: /tmp/linearjc/data/daily_report.csv, kind: file}
 
   # Example: Directory output with specific structure
-  # website_build: {type: filesystem, path_type: directory, path: /var/www/html/site, readable: true, writable: false}
+  # website_build: {type: fs, path: /var/www/html/site, kind: dir}

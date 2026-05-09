@@ -2,24 +2,38 @@
 
 This directory contains example job configurations for LinearJC.
 
-## Data Registry Path Types
+## Data Registry (Phase 15 Register Model)
 
-LinearJC requires explicit declaration of whether a registry entry is a file or directory:
+LinearJC uses a mainframe-inspired register model with three types:
 
-**path_type: file**
-- Single file expected
-- Archive must contain exactly one file
-- Extraction validates and moves file to registry path
-- Example: `/tmp/data/report.csv`
+| Type | Storage | Persistence | Use Case |
+|------|---------|-------------|----------|
+| `fs` | Filesystem | Permanent | Managed outputs, external inputs |
+| `temp` | MinIO | Chain duration | Intermediates between jobs |
+| `minio` | MinIO bucket | Permanent | Large objects |
 
-**path_type: directory**
-- Directory with contents (single or multiple files)
-- Archive extracted to registry path
-- Preserves full directory structure
-- Example: `/tmp/data/website_build/`
+**Example registry.yaml:**
+```yaml
+registry:
+  # Protected input (read-only)
+  source_data: {type: fs, path: /data/source.csv, kind: file, protect: true}
 
-**Validation:**
-After extraction, LinearJC validates the result matches the declared type. If a job creates multiple files but the registry declares `path_type: file`, extraction will fail with a clear error message.
+  # Managed outputs
+  daily_report: {type: fs, path: /data/reports/daily.csv, kind: file}
+  archive_dir:  {type: fs, path: /data/archives/, kind: dir}
+
+  # Temporary (chain-only)
+  intermediate: {type: temp, kind: file}
+```
+
+**kind: file vs dir**
+- `kind: file` - Single file. Archive must contain exactly one file.
+- `kind: dir` - Directory with contents. Preserves structure.
+
+**protect: true (fs only)**
+- External inputs that jobs cannot write to
+- Must exist at coordinator startup
+- Use for databases, configs from other systems
 
 **Design Philosophy:**
 Following mainframe JCL principles - explicitly declare what you're creating (like `DSORG=PS` vs `DSORG=PO`), and the system validates it matches. No guessing from file extensions or runtime inspection.
@@ -29,26 +43,46 @@ Following mainframe JCL principles - explicitly declare what you're creating (li
 ### hello.world.yaml
 Simple test job that demonstrates basic LinearJC functionality.
 
-- **Duration**: ~1 second
-- **Timeout**: 300 seconds
-- **Schedule**: 32-48 runs/day
-- **Dependencies**: None (root job)
-- **Inputs**: `hello_input` (from data registry)
-- **Outputs**: `hello_output` (to data registry)
+```yaml
+job:
+  id: hello.world
+  version: "1.0.0"
+  reads: [hello_input]      # Registry keys for inputs
+  writes: [hello_output]    # Registry keys for outputs
+  depends: []               # Root job (no dependencies)
+  schedule:
+    min_daily: 32
+    max_daily: 48
+  run:
+    user: nobody
+    timeout: 300
+```
 
-This job reads an input file, processes it, and writes output.
+- **Duration**: ~1 second
+- **Reads**: `hello_input` (from data registry)
+- **Writes**: `hello_output` (to data registry)
 
 ### hello.followup.yaml
 Demonstrates job dependencies and data flow between jobs.
 
-- **Duration**: ~1 second
-- **Timeout**: 300 seconds
-- **Schedule**: 32-48 runs/day
-- **Dependencies**: `hello.world` (waits for it to complete)
-- **Inputs**: `hello_output` (output from hello.world)
-- **Outputs**: `followup_output` (to data registry)
+```yaml
+job:
+  id: hello.followup
+  version: "1.0.0"
+  reads: [hello_output]       # Reads previous job's output
+  writes: [followup_output]
+  depends: [hello.world]      # Runs after hello.world
+  schedule:
+    min_daily: 32
+    max_daily: 48
+  run:
+    user: nobody
+    timeout: 300
+```
 
-This job runs after `hello.world` completes and processes its output.
+- **Depends**: `hello.world` (waits for it to complete)
+- **Reads**: `hello_output` (output from hello.world)
+- **Writes**: `followup_output` (to data registry)
 
 ## Creating a Timeout Test Job
 
@@ -58,21 +92,15 @@ If you want to test timeout handling, create a job like this:
 job:
   id: test.timeout
   version: "1.0.0"
-  depends_on: []
-
+  reads: [some_input]
+  writes: [timeout_output]
+  depends: []
   schedule:
     min_daily: 1
     max_daily: 10
-
-  executor:
+  run:
     user: youruser
     timeout: 30  # 30 second timeout
-
-  inputs:
-    input_file: some_input
-
-  outputs:
-    output_file: timeout_output
 ```
 
 Then create a job script that intentionally runs longer than the timeout (e.g., sleep 60 seconds).
@@ -84,3 +112,34 @@ Then create a job script that intentionally runs longer than the timeout (e.g., 
 ```
 
 This is normal - the coordinator times out and stops tracking the job, but the executor continues running and sends completion updates for a job the coordinator has already given up on.
+
+## Using Temp Registers for Chains
+
+For linear chains, use `type: temp` for intermediate data:
+
+```yaml
+# registry.yaml
+registry:
+  source_data: {type: fs, path: /data/source.csv, kind: file, protect: true}
+  intermediate: {type: temp, kind: file}  # Chain-only, auto-cleaned
+  final_output: {type: fs, path: /data/output.csv, kind: file}
+
+# job1 (root)
+job:
+  id: process.data
+  reads: [source_data]
+  writes: [intermediate]  # Goes to MinIO temp
+  depends: []
+
+# job2 (depends on job1)
+job:
+  id: export.result
+  reads: [intermediate]   # Reads from MinIO temp (fast)
+  writes: [final_output]  # Write-through to filesystem
+  depends: [process.data]
+```
+
+Temp registers:
+- Live only in MinIO during chain execution
+- Enable parallel fan-out (each tree gets unique path)
+- Auto-cleaned when tree completes or fails

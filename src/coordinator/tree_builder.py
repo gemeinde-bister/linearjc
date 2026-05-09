@@ -85,11 +85,14 @@ def build_trees(jobs: List[Job]) -> List[JobTree]:
     """
     Build linear job trees from jobs.
 
+    Supports fan-out: if job A has multiple dependents (B and C), two separate
+    trees are created, each containing A. A executes once per tree.
+
     Algorithm:
     1. Check for cycles
-    2. Find root jobs (no dependencies)
-    3. For each root, build a linear tree by following dependencies
-    4. Validate that each tree is truly linear (no branching)
+    2. Find leaf jobs (no dependents)
+    3. For each leaf, trace back to root to build a linear path
+    4. Each unique path becomes a tree (fan-out creates multiple trees)
     5. Calculate tree schedule (most restrictive)
 
     Args:
@@ -99,7 +102,7 @@ def build_trees(jobs: List[Job]) -> List[JobTree]:
         List of JobTree objects
 
     Raises:
-        TreeBuilderError: If cycles exist or trees are non-linear
+        TreeBuilderError: If cycles exist or jobs have multiple dependencies
     """
     # Check for cycles
     cycles = detect_cycles(jobs)
@@ -107,42 +110,118 @@ def build_trees(jobs: List[Job]) -> List[JobTree]:
         cycle_strs = [" → ".join(cycle) for cycle in cycles]
         raise TreeBuilderError(f"Circular dependencies detected: {', '.join(cycle_strs)}")
 
-    # Build dependency graph
+    # Validate single dependency constraint (no merge points)
+    for job in jobs:
+        if len(job.depends) > 1:
+            raise TreeBuilderError(
+                f"Job {job.id} has multiple dependencies: {job.depends}. "
+                f"Merge points are not supported (each job can depend on at most one other job)."
+            )
+
+    # Build dependency graph (job_id -> set of dependents)
     graph = build_dependency_graph(jobs)
     job_map = {job.id: job for job in jobs}
 
-    # Find root jobs (no dependencies)
-    roots = [job for job in jobs if not job.depends]
+    # Find leaf jobs (no dependents in the graph)
+    leaves = [job for job in jobs if not graph.get(job.id)]
 
-    if not roots:
-        raise TreeBuilderError("No root jobs found (all jobs have dependencies)")
+    if not leaves:
+        raise TreeBuilderError("No leaf jobs found (circular or incomplete graph)")
 
-    logger.info(f"Found {len(roots)} root jobs: {[r.id for r in roots]}")
+    logger.info(f"Found {len(leaves)} leaf jobs: {[l.id for l in leaves]}")
 
-    # Build tree for each root
+    # Build tree for each leaf by tracing back to root
     trees = []
-    for root in roots:
+    for leaf in leaves:
         try:
-            tree = build_linear_tree(root, graph, job_map)
+            tree = build_tree_from_leaf(leaf, job_map)
             trees.append(tree)
             logger.info(f"Built tree: {tree}")
         except TreeBuilderError as e:
-            logger.error(f"Failed to build tree from root {root.id}: {e}")
+            logger.error(f"Failed to build tree from leaf {leaf.id}: {e}")
             raise
 
-    # Validate that all jobs are in exactly one tree
+    # Note: With fan-out, jobs CAN appear in multiple trees (that's the feature!)
+    # But every job must appear in at least one tree
     all_tree_jobs = set()
     for tree in trees:
         for job in tree.jobs:
-            if job.id in all_tree_jobs:
-                raise TreeBuilderError(f"Job {job.id} appears in multiple trees")
             all_tree_jobs.add(job.id)
 
     missing_jobs = set(job_map.keys()) - all_tree_jobs
     if missing_jobs:
         raise TreeBuilderError(f"Jobs not in any tree: {missing_jobs}")
 
+    # Log fan-out info
+    job_tree_count = {}
+    for tree in trees:
+        for job in tree.jobs:
+            job_tree_count[job.id] = job_tree_count.get(job.id, 0) + 1
+
+    duplicated = {jid: count for jid, count in job_tree_count.items() if count > 1}
+    if duplicated:
+        logger.info(f"Fan-out detected - jobs in multiple trees: {duplicated}")
+
     return trees
+
+
+def build_tree_from_leaf(leaf: Job, job_map: Dict[str, Job]) -> JobTree:
+    """
+    Build a linear tree by tracing from leaf back to root.
+
+    Args:
+        leaf: Leaf job (no dependents)
+        job_map: Mapping of job_id -> Job
+
+    Returns:
+        JobTree with jobs ordered from root to leaf
+
+    Raises:
+        TreeBuilderError: If dependency chain is broken
+    """
+    # Trace back from leaf to root
+    path = []
+    current = leaf
+
+    while current:
+        path.append(current)
+
+        if not current.depends:
+            # Reached root
+            break
+
+        # Move to dependency (single dependency guaranteed by validation)
+        dep_id = current.depends[0]
+        if dep_id not in job_map:
+            raise TreeBuilderError(
+                f"Job {current.id} depends on {dep_id} which does not exist"
+            )
+        current = job_map[dep_id]
+
+    # Reverse to get root-to-leaf order
+    jobs = list(reversed(path))
+    root = jobs[0]
+
+    # Calculate tree schedule (most restrictive)
+    min_daily = max(job.schedule.min_daily for job in jobs)
+    max_daily = min(job.schedule.max_daily for job in jobs)
+
+    if min_daily > max_daily:
+        job_schedules = ", ".join([
+            f"{job.id}(min={job.schedule.min_daily},max={job.schedule.max_daily})"
+            for job in jobs
+        ])
+        raise TreeBuilderError(
+            f"Tree has incompatible schedules: {job_schedules}. "
+            f"Calculated tree_min={min_daily}, tree_max={max_daily} (impossible)."
+        )
+
+    return JobTree(
+        root=root,
+        jobs=jobs,
+        min_daily=min_daily,
+        max_daily=max_daily
+    )
 
 
 def build_linear_tree(root: Job, graph: Dict[str, Set[str]], job_map: Dict[str, Job]) -> JobTree:

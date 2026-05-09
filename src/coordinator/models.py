@@ -1,10 +1,12 @@
 """
 Data models for LinearJC coordinator.
 
-Format follows SPEC.md v0.5.0-draft (2025-11-25).
+Format follows SPEC.md v0.8.0-draft (2026-01-13).
+Includes Phase 15 register model with temp/minio/fs types.
 """
-from typing import List, Dict, Optional
-from pydantic import BaseModel, Field, field_validator
+from typing import Dict, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pathlib import Path
 
 from coordinator.security_utils import validate_job_id, validate_registry_key
@@ -102,27 +104,48 @@ class JobFile(BaseModel):
 
 
 class DataRegistryEntry(BaseModel):
-    """Entry in the data registry (SPEC.md v0.5.0 format)."""
-    type: str = Field(description="Storage type: fs or minio")
-    # Filesystem fields
-    path: Optional[str] = None
-    kind: Optional[str] = Field(default=None, description="Path kind: file or dir")
-    # MinIO fields
-    bucket: Optional[str] = None
-    prefix: Optional[str] = None
+    """
+    Entry in the data registry.
 
-    @field_validator('type')
-    @classmethod
-    def validate_type(cls, v: str) -> str:
-        """Validate storage type."""
-        if v not in ['fs', 'minio']:
-            raise ValueError(f"Invalid type: {v}. Must be 'fs' or 'minio'")
-        return v
+    Supports three register types:
+    - fs: Filesystem storage (permanent, write-through)
+    - temp: Temporary MinIO storage (chain duration only)
+    - minio: Permanent MinIO storage (large objects)
+
+    See phase15-register-model-SPEC.md for full semantics.
+    """
+
+    type: Literal["fs", "temp", "minio"] = Field(
+        description="Storage type: fs (filesystem), temp (chain-only), or minio (permanent)"
+    )
+    kind: Literal["file", "dir"] = Field(
+        description="Data kind: file (single) or dir (directory)"
+    )
+
+    # Filesystem fields (type: fs)
+    path: Optional[str] = Field(
+        default=None,
+        description="Absolute filesystem path (required for fs type)"
+    )
+    protect: bool = Field(
+        default=False,
+        description="Write-protected external input (fs type only)"
+    )
+
+    # MinIO fields (type: minio)
+    bucket: Optional[str] = Field(
+        default=None,
+        description="MinIO bucket name (required for minio type)"
+    )
+    prefix: Optional[str] = Field(
+        default=None,
+        description="Object prefix within bucket (optional for minio type)"
+    )
 
     @field_validator('path')
     @classmethod
-    def validate_path_field(cls, v: Optional[str], info) -> Optional[str]:
-        """Validate filesystem path for security (basic check)."""
+    def validate_path_field(cls, v: Optional[str]) -> Optional[str]:
+        """Validate filesystem path for security."""
         if v is None:
             return v
 
@@ -134,22 +157,77 @@ class DataRegistryEntry(BaseModel):
 
         return v
 
-    @field_validator('kind')
+    @field_validator('bucket')
     @classmethod
-    def validate_kind(cls, v: Optional[str], info) -> Optional[str]:
-        """Validate kind field."""
+    def validate_bucket_field(cls, v: Optional[str]) -> Optional[str]:
+        """Validate MinIO bucket name (S3 naming rules)."""
         if v is None:
             return v
 
-        # kind only valid for fs type
-        entry_type = info.data.get('type')
-        if entry_type != 'fs':
-            raise ValueError(f"kind only valid for fs type, not {entry_type}")
+        import re
+        # S3/MinIO bucket naming: 3-63 chars, lowercase alphanumeric, dots, hyphens
+        # Must start and end with alphanumeric
+        if not re.match(r'^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$', v):
+            raise ValueError(
+                f"Invalid bucket name: {v}. "
+                "Must be 3-63 chars, lowercase alphanumeric, dots, hyphens."
+            )
+        return v
 
-        if v not in ['file', 'dir']:
-            raise ValueError(f"kind must be 'file' or 'dir', got: {v}")
+    @field_validator('prefix')
+    @classmethod
+    def validate_prefix_field(cls, v: Optional[str]) -> Optional[str]:
+        """Validate MinIO prefix for path traversal."""
+        if v is None:
+            return v
+
+        if '..' in v:
+            raise ValueError(f"Path traversal in prefix: {v}")
+        if v.startswith('/'):
+            raise ValueError(f"Prefix must not start with /: {v}")
 
         return v
+
+    @model_validator(mode="after")
+    def validate_type_fields(self) -> "DataRegistryEntry":
+        """
+        Cross-field validation based on register type.
+
+        Ensures each type has exactly the required fields and no invalid combinations.
+        """
+        if self.type == "fs":
+            # fs requires path
+            if not self.path:
+                raise ValueError("path required for type: fs")
+            # fs cannot have bucket/prefix
+            if self.bucket:
+                raise ValueError("bucket not allowed for type: fs")
+            if self.prefix:
+                raise ValueError("prefix not allowed for type: fs")
+
+        elif self.type == "temp":
+            # temp cannot have path, bucket, prefix, or protect
+            if self.path:
+                raise ValueError("path not allowed for type: temp")
+            if self.bucket:
+                raise ValueError("bucket not allowed for type: temp")
+            if self.prefix:
+                raise ValueError("prefix not allowed for type: temp")
+            if self.protect:
+                raise ValueError("protect not allowed for type: temp (always writable within chain)")
+
+        elif self.type == "minio":
+            # minio requires bucket
+            if not self.bucket:
+                raise ValueError("bucket required for type: minio")
+            # minio cannot have path
+            if self.path:
+                raise ValueError("path not allowed for type: minio")
+            # minio cannot be protected (external input must be fs)
+            if self.protect:
+                raise ValueError("protect not supported for type: minio")
+
+        return self
 
 
 class DataRegistry(BaseModel):
@@ -167,8 +245,7 @@ class JobTree(BaseModel):
     next_execution: Optional[float] = None  # Unix timestamp
     execution_history: List[float] = Field(default_factory=list, description="Recent execution timestamps (last 25h)")
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def record_execution(self, timestamp: float) -> None:
         """
@@ -316,6 +393,10 @@ class CoordinatorConfig(BaseModel):
     work_dir: str = Field(
         default="/var/lib/linearjc/work",
         description="Working directory for temporary files during job execution"
+    )
+    tools_registry: str | None = Field(
+        default=None,
+        description="Path to tools registry YAML file for ljc/executor self-update"
     )
     scheduling: SchedulingConfig
     signing: SigningConfig

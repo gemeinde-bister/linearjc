@@ -302,3 +302,97 @@ def validate_minio_credentials(access_key: str, secret_key: str) -> None:
         )
 
     logger.debug("Minio credentials validation passed")
+
+
+# =============================================================================
+# Phase 15 Register Model Validation
+# =============================================================================
+
+def validate_job_writes_against_registry(
+    job_id: str,
+    writes: List[str],
+    registry: dict,
+) -> None:
+    """
+    Validate that a job doesn't write to protected registers.
+
+    Protected registers (protect: true) are external inputs that jobs
+    can read but not write. This prevents accidental overwriting of
+    production data sources.
+
+    Args:
+        job_id: Job identifier (for error messages)
+        writes: List of registry keys the job writes to
+        registry: Data registry mapping (key -> DataRegistryEntry)
+
+    Raises:
+        SecurityError: If job attempts to write to a protected register
+
+    Example:
+        >>> validate_job_writes_against_registry(
+        ...     "my.job",
+        ...     ["output"],
+        ...     {"output": DataRegistryEntry(type="fs", path="/data/out", kind="file", protect=True)}
+        ... )
+        SecurityError: Job 'my.job' cannot write to protected register 'output'
+    """
+    for key in writes:
+        entry = registry.get(key)
+        if entry is None:
+            # Missing registry key - will be caught by other validation
+            continue
+
+        # Check if entry has protect attribute and it's True
+        if getattr(entry, "protect", False):
+            raise SecurityError(
+                f"Job '{job_id}' cannot write to protected register '{key}'\n"
+                f"Protected registers are external inputs (protect: true) "
+                f"that cannot be overwritten by jobs."
+            )
+
+
+def validate_protected_registers_exist(registry: dict) -> None:
+    """
+    Verify all protected registers exist on the filesystem.
+
+    Protected registers (protect: true) must exist at startup since
+    they are external inputs that jobs depend on. If they don't exist,
+    jobs will fail to read them.
+
+    Args:
+        registry: Data registry mapping (key -> DataRegistryEntry)
+
+    Raises:
+        SecurityError: If any protected register doesn't exist
+
+    Example:
+        >>> validate_protected_registers_exist({
+        ...     "source_db": DataRegistryEntry(
+        ...         type="fs", path="/missing/file.db", kind="file", protect=True
+        ...     )
+        ... })
+        SecurityError: Protected register 'source_db' not found: /missing/file.db
+    """
+    missing = []
+
+    for key, entry in registry.items():
+        # Only check fs type with protect=True
+        if getattr(entry, "type", None) != "fs":
+            continue
+        if not getattr(entry, "protect", False):
+            continue
+
+        path = getattr(entry, "path", None)
+        if not path:
+            continue
+
+        # Check existence
+        p = Path(path)
+        if not p.exists():
+            missing.append((key, path))
+
+    if missing:
+        error_lines = ["Protected registers not found (protect: true must exist):"]
+        for key, path in missing:
+            error_lines.append(f"  - {key}: {path}")
+        raise SecurityError("\n".join(error_lines))

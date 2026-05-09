@@ -138,6 +138,7 @@ class TestOutputConflictDetection:
                 type='minio',
                 bucket='linearjc',
                 prefix='outputs/shared',
+                kind='dir',
             ),
         }
         validator = TreeOutputValidator(registry)

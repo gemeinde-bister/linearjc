@@ -133,21 +133,69 @@ class TestBuildTrees:
             build_trees(jobs)
 
     def test_no_roots_raises(self):
-        """All jobs have dependencies raises error."""
+        """All jobs have dependencies on non-existent job raises error."""
         jobs = [
-            make_job("a", depends=["b"]),
+            make_job("a", depends=["b"]),  # b doesn't exist
         ]
-        with pytest.raises(TreeBuilderError, match="No root"):
+        with pytest.raises(TreeBuilderError, match="does not exist"):
             build_trees(jobs)
 
-    def test_branching_raises(self):
-        """Branching (one job with multiple dependents) raises error."""
+    def test_branching_creates_multiple_trees(self):
+        """Branching (fan-out) creates separate trees with duplicated root."""
         jobs = [
             make_job("a"),
             make_job("b", depends=["a"]),
             make_job("c", depends=["a"]),  # Both b and c depend on a
         ]
-        with pytest.raises(TreeBuilderError, match="multiple dependents"):
+        trees = build_trees(jobs)
+
+        # Should create 2 trees: [a, b] and [a, c]
+        assert len(trees) == 2
+
+        # Both trees should have 'a' as root
+        roots = {tree.root.id for tree in trees}
+        assert roots == {"a"}
+
+        # Each tree should have 2 jobs
+        for tree in trees:
+            assert len(tree.jobs) == 2
+            assert tree.jobs[0].id == "a"  # Root first
+
+        # Leaves should be b and c
+        leaves = {tree.jobs[-1].id for tree in trees}
+        assert leaves == {"b", "c"}
+
+    def test_mid_chain_fanout(self):
+        """Fan-out in middle of chain creates trees with shared prefix."""
+        jobs = [
+            make_job("a"),
+            make_job("b", depends=["a"]),
+            make_job("c", depends=["b"]),
+            make_job("d", depends=["b"]),  # Both c and d depend on b
+        ]
+        trees = build_trees(jobs)
+
+        # Should create 2 trees: [a, b, c] and [a, b, d]
+        assert len(trees) == 2
+
+        # Both trees should have same prefix [a, b]
+        for tree in trees:
+            assert len(tree.jobs) == 3
+            assert tree.jobs[0].id == "a"
+            assert tree.jobs[1].id == "b"
+
+        # Leaves should be c and d
+        leaves = {tree.jobs[-1].id for tree in trees}
+        assert leaves == {"c", "d"}
+
+    def test_merge_raises(self):
+        """Merge points (job with multiple dependencies) raises error."""
+        jobs = [
+            make_job("a"),
+            make_job("b"),
+            make_job("c", depends=["a", "b"]),  # c depends on both a and b
+        ]
+        with pytest.raises(TreeBuilderError, match="multiple dependencies"):
             build_trees(jobs)
 
     def test_schedule_calculation(self):
