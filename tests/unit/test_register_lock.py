@@ -9,7 +9,7 @@ Tests cover:
 - Deadlock prevention via sorted ordering
 - Lock path resolution
 
-See phase15-register-model-SPEC.md Section 3 for specification.
+See SPEC.md, Register Locking (ENQ/DEQ) section for specification.
 """
 import pytest
 import sys

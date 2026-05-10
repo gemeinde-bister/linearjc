@@ -41,11 +41,14 @@ The important rule is data readiness, not graph drawing: a job is eligible when 
 - Broad historical backfill machinery across many independent paths.
 - Full multi‑tenant workflows with interactive UIs and pluggable schedulers.
 
-## Multi-input barrier model
+## Multi-input barrier model (planned, not yet implemented)
 
-Some batch work needs to generate data from the results of multiple other modules. The LinearJC direction is to express this through registers, not duplicated task dependencies.
+Some batch work needs to generate data from the results of multiple other modules. The LinearJC direction is to express this through registers, not duplicated task dependencies. The current implementation supports linear chains and fan-out only; the barrier model below is the planned evolution.
 
 ```yaml
+# Conceptual example - this multi-input pattern is not yet accepted by the coordinator.
+# Currently, each job can depend on at most one other job (linear chains only).
+
 registry:
   source_sales:       {type: fs, path: /data/source/sales.csv, kind: file, protect: true}
   source_inventory:   {type: fs, path: /data/source/inventory.csv, kind: file, protect: true}
@@ -67,7 +70,7 @@ jobs:
     writes: [daily_report]
 ```
 
-In this model, `build.report` is a barrier job. It runs only after `sales_extract` and `inventory_extract` are both ready for the same batch generation. The implementation may use graph structures internally, but the user-facing contract remains: modules produce and consume named registers.
+In this model, `build.report` would be a barrier job. It runs only after `sales_extract` and `inventory_extract` are both ready for the same batch generation. The coordinator would infer dependencies from register ownership rather than requiring explicit `depends:` links. See [ROADMAP.md](ROADMAP.md) for implementation priorities.
 
 ## Migrating from cron
 
@@ -116,11 +119,17 @@ Transport and data
 TLS for MQTT and MinIO is recommended for production. Example configs use development defaults; replace them before deployment.
 
 ## Status and scope
-- Current scope: linear chains and fan-out. No general DAG semantics.
-- Product direction: register-driven barrier jobs for multi-input consolidation, while avoiding arbitrary DAG authoring.
+- Current scope: linear chains and fan-out with explicit `depends:` links. No general DAG semantics.
 - Archive format: tar.gz.
 - State: coordinator keeps scheduling state in memory; executor is stateless.
 - This repository includes examples and scripts for local evaluation and tests.
+
+### Current limitations
+- **Fan-out duplicates root execution**: Each consuming tree runs its own copy of the shared root job. For expensive jobs (e.g., a 6-hour simulation), compute cost scales linearly with the number of consumers.
+- **No generation scoping**: No guarantee that downstream jobs consume data from the same batch run. Partial failure + retry can mix fresh and stale data.
+- **No atomic deployment**: `ljc deploy` pushes one package at a time. Coordinated updates across multiple jobs have a window of inconsistency.
+
+The planned direction is register-driven barrier execution: the coordinator infers dependencies from register ownership (`reads:`/`writes:`), each job runs once per batch generation, and multi-input barriers emerge naturally. See [ROADMAP.md](ROADMAP.md) for priorities and motivation.
 
 ## Quick start (development)
 
@@ -219,10 +228,9 @@ Executors read environment variables:
 - MQTT and MinIO are external dependencies.
 - Production deployments should enable TLS for MQTT and MinIO and provide strong secrets.
 
-## Roadmap (non‑binding)
-- Optional retries with backoff for artifact transfers.
-- TLS configuration examples for MQTT and MinIO.
-- Systemd unit examples and log rotation guidance.
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the full prioritized roadmap with motivation.
 
 ## Project structure
 

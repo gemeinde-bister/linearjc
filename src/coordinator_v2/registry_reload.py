@@ -4,7 +4,7 @@ Registry reload validation for hot reload safety.
 Validates that registry changes during SIGHUP reload are safe given
 current lock state. Prevents data corruption and lock inconsistencies.
 
-Design follows phase15-register-model-SPEC.md Section 11.7:
+Design follows SPEC.md, Hot Reload (SIGHUP) section:
 - Add new register: OK
 - Modify register path: Warn if trees active (locks on old path)
 - Remove register: Block if active trees reference it

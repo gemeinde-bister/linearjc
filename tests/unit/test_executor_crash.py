@@ -6,7 +6,7 @@ Tests cover:
 - Dead executor handling: marks trees failed, releases locks, cleans up MinIO
 - Edge cases: no jobs on dead executor, multiple executors dying
 
-See phase15-register-model-SPEC.md Section 3.9 for specification.
+See SPEC.md, Register Locking (ENQ/DEQ) section for specification.
 """
 import time
 import pytest

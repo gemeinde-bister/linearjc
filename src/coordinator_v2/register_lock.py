@@ -4,7 +4,7 @@ RegisterLock - ENQ/DEQ style locking for permanent registers.
 Implements readers-writer locks with FIFO wait queue for fair scheduling.
 Prevents RAW, WAW, and WAR hazards across concurrent tree executions.
 
-Design follows phase15-register-model-SPEC.md Section 3.
+Design follows SPEC.md, Register Locking (ENQ/DEQ) section.
 
 Key invariants:
 - All-or-nothing acquisition: A tree holds ALL its locks or NONE

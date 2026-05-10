@@ -112,7 +112,7 @@ class DataRegistryEntry(BaseModel):
     - temp: Temporary MinIO storage (chain duration only)
     - minio: Permanent MinIO storage (large objects)
 
-    See phase15-register-model-SPEC.md for full semantics.
+    See SPEC.md, Data Model section for full semantics.
     """
 
     type: Literal["fs", "temp", "minio"] = Field(

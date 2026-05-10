@@ -45,7 +45,7 @@ The executor uses the shebang directly - no hardcoded interpreters.
 
 ```bash
 # Validate outputs exist
-if [ ! -f "$LINEARJC_OUTPUT_DIR/output_file/result.txt" ]; then
+if [ ! -f "out/output_file/result.txt" ]; then
     echo "ERROR: Expected output not created"
     exit 1
 fi
@@ -56,26 +56,36 @@ exit 0
 
 **Why**: LinearJC uses exit codes to determine job success/failure. Exiting 0 when outputs fail creates false success reports.
 
-### 3. Environment Variables
+### 3. Workdir and Paths
 
-Available in all job scripts:
+Scripts execute from a workdir with a fixed structure. All I/O uses **relative paths**:
+
+```
+{workdir}/
+  script.sh       # Your entry script
+  bin/             # Bundled binaries (from package)
+  data/            # Bundled static data (from package)
+  in/              # Inputs (populated by executor, read-only)
+  out/             # Outputs (job writes here)
+  tmp/             # Scratch space
+```
+
+**Environment variables** (identification only, not paths):
 
 - `LINEARJC_JOB_ID`: Job identifier (e.g., `backup.daily`)
 - `LINEARJC_EXECUTION_ID`: Unique execution (e.g., `backup.daily-20251116-140530-a1b2c3d4`)
-- `LINEARJC_INPUT_DIR`: Extracted input artifacts directory
-- `LINEARJC_OUTPUT_DIR`: Directory for output artifacts
 
 ### 4. Output Structure
 
-Create subdirectories matching your job definition output names:
+Create subdirectories under `out/` matching your job definition output names:
 
 **For directory outputs (`kind: dir`):**
 ```bash
 # Job YAML defines: writes: [website]
 # Registry defines: kind: dir
-mkdir -p "$LINEARJC_OUTPUT_DIR/website"
-echo "<html>..." > "$LINEARJC_OUTPUT_DIR/website/index.html"
-echo "body { }" > "$LINEARJC_OUTPUT_DIR/website/style.css"
+mkdir -p out/website
+echo "<html>..." > out/website/index.html
+echo "body { }" > out/website/style.css
 # Multiple files allowed
 ```
 
@@ -83,8 +93,8 @@ echo "body { }" > "$LINEARJC_OUTPUT_DIR/website/style.css"
 ```bash
 # Job YAML defines: writes: [daily_report]
 # Registry defines: kind: file
-mkdir -p "$LINEARJC_OUTPUT_DIR/daily_report"
-echo "Date,Value" > "$LINEARJC_OUTPUT_DIR/daily_report/report.csv"
+mkdir -p out/daily_report
+echo "Date,Value" > out/daily_report/report.csv
 # Only ONE file in the directory - validated at extraction
 ```
 
@@ -359,14 +369,16 @@ Jobs can spawn containers for isolation:
 # Job runs as root (needs Docker socket)
 # Container provides isolation boundary
 
+WORKDIR="$(pwd)"
+
 docker run --rm \
-  --mount "type=bind,source=${LINEARJC_INPUT_DIR},target=/inputs,readonly" \
-  --mount "type=bind,source=${LINEARJC_OUTPUT_DIR}/result,target=/outputs" \
+  --mount "type=bind,source=${WORKDIR}/in,target=/inputs,readonly" \
+  --mount "type=bind,source=${WORKDIR}/out/result,target=/outputs" \
   alpine:latest \
   /bin/sh -c 'process /inputs/* > /outputs/result.txt'
 
 # Validate output created
-[ -f "$LINEARJC_OUTPUT_DIR/result/result.txt" ] || exit 1
+[ -f "out/result/result.txt" ] || exit 1
 exit 0
 ```
 
@@ -381,12 +393,12 @@ Compiled programs can be integrated via shell wrapper scripts:
 # Wrapper for compiled binary
 
 # Example: Using a standard binary (could be custom Go/Rust/C program)
-cat "$LINEARJC_INPUT_DIR/data/input.txt" | \
+cat in/data/input.txt | \
     tr '[:lower:]' '[:upper:]' | \
-    tee "$LINEARJC_OUTPUT_DIR/result/output.txt"
+    tee out/result/output.txt
 
 # Validate output exists
-if [ ! -f "$LINEARJC_OUTPUT_DIR/result/output.txt" ]; then
+if [ ! -f "out/result/output.txt" ]; then
     echo "ERROR: Binary failed to create output"
     exit 1
 fi
@@ -410,7 +422,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Validate expected outputs
-[ -f "$LINEARJC_OUTPUT_DIR/result/data.out" ] || exit 1
+[ -f "out/result/data.out" ] || exit 1
 
 exit 0
 ```

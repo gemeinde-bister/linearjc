@@ -7,7 +7,7 @@ Tests cover:
 - Blocking vs warning behavior
 - Integration with RegisterLock
 
-See phase15-register-model-SPEC.md Section 11.7 for specification.
+See SPEC.md, Hot Reload (SIGHUP) section for specification.
 """
 
 import pytest

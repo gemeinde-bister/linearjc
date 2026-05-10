@@ -1,7 +1,7 @@
 # LinearJC Specification
 
-**Version**: 0.8.0-draft
-**Last Updated**: 2026-01-13
+**Version**: 0.9.0-draft
+**Last Updated**: 2026-05-10
 
 ---
 
@@ -29,33 +29,33 @@ Modern orchestration tools (Airflow, Nomad, Kubernetes) optimize for flexibility
 ### System Components
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  ljc (Developer Tool)                                           │
-│  • Single source of truth for jobs and registry                 │
-│  • Full validation before deployment                            │
-│  • Builds self-contained .ljc packages                          │
-│  • Local testing with `ljc test` (uses linearjc-core)           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ push registry + deploy packages
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Coordinator                                                    │
-│  • Receives validated artifacts                                 │
-│  • Builds execution trees from register ownership and chains     │
-│  • Schedules jobs, manages register locks                       │
-│  • Dispatches work to executors                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ MQTT job requests
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Executor(s)                                                    │
-│  • Runs on plain Linux (not containerized)                      │
-│  • Thin wrapper around linearjc-core                            │
-│  • Executes jobs with optional isolation (Landlock, cgroups)    │
-│  • Reports progress and results via MQTT                        │
-└─────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------+
+|  ljc (Developer Tool)                                           |
+|  - Single source of truth for jobs and registry                 |
+|  - Full validation before deployment                            |
+|  - Builds self-contained .ljc packages                          |
+|  - Local testing with ljc test (uses linearjc-core)             |
++-----------------------------------------------------------------+
+                              |
+                              | push registry + deploy packages
+                              v
++-----------------------------------------------------------------+
+|  Coordinator                                                    |
+|  - Receives validated artifacts                                 |
+|  - Builds execution trees from register ownership and chains    |
+|  - Schedules jobs, manages register locks                       |
+|  - Dispatches work to executors                                 |
++-----------------------------------------------------------------+
+                              |
+                              | MQTT job requests
+                              v
++-----------------------------------------------------------------+
+|  Executor(s)                                                    |
+|  - Runs on plain Linux (not containerized)                      |
+|  - Thin wrapper around linearjc-core                            |
+|  - Executes jobs with optional isolation (Landlock, cgroups)    |
+|  - Reports progress and results via MQTT                        |
++-----------------------------------------------------------------+
 ```
 
 ### Shared Core Architecture
@@ -63,29 +63,26 @@ Modern orchestration tools (Airflow, Nomad, Kubernetes) optimize for flexibility
 The security-critical execution code is shared between `ljc` and the executor:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  linearjc-core (shared Rust crate)                              │
-│  ══════════════════════════════════                             │
-│  • workdir.rs    - Workdir creation and setup                   │
-│  • isolation.rs  - Landlock, cgroups, network namespaces        │
-│  • execution.rs  - Fork, setuid, exec                           │
-│  • archive.rs    - Tar/gzip handling                            │
-│                                                                 │
-│  Small, auditable, security-critical code                       │
-└─────────────────────────────────────────────────────────────────┘
-                    │                           │
-          ┌────────┴────────┐         ┌────────┴────────┐
-          ▼                 ▼         ▼                 ▼
-┌─────────────────────┐   ┌─────────────────────────────────────┐
-│  Executor           │   │  ljc                                │
-│  ═════════          │   │  ═══                                │
-│  • MQTT client      │   │  • Repository management            │
-│  • Input download   │   │  • Validation                       │
-│  • Output upload    │   │  • Package building                 │
-│  • Progress report  │   │  • MQTT deployment                  │
-│                     │   │  • `ljc test` command               │
-│  Thin, minimal      │   │                                     │
-└─────────────────────┘   └─────────────────────────────────────┘
++-----------------------------------------------------------------+
+|  linearjc-core (shared Rust crate)                              |
+|  - workdir.rs    - Workdir creation and setup                   |
+|  - isolation.rs  - Landlock, cgroups, network namespaces        |
+|  - execution.rs  - Fork, setuid, exec                           |
+|  - archive.rs    - Tar/gzip handling                            |
+|                                                                 |
+|  Small, auditable, security-critical code                       |
++-----------------------------------------------------------------+
+          |                                     |
+          v                                     v
++---------------------+   +-------------------------------------+
+|  Executor           |   |  ljc                                |
+|  - MQTT client      |   |  - Repository management            |
+|  - Input download   |   |  - Validation                       |
+|  - Output upload    |   |  - Package building                 |
+|  - Progress report  |   |  - MQTT deployment                  |
+|                     |   |  - ljc test command                 |
+|  Thin, minimal      |   |                                     |
++---------------------+   +-------------------------------------+
 ```
 
 **Benefits:**
@@ -112,7 +109,7 @@ The primary rule is:
 
 > A job is eligible when all `reads:` registers are ready for the current batch generation and all `writes:` registers can be exclusively locked.
 
-Current releases implement this through linear chains and fan-out trees. The intended evolution for multi-input work is register-driven barrier jobs: a module can read results from multiple writer modules, and it runs only when all those registers are ready for the same batch generation.
+Current releases implement this through linear chains and fan-out trees with explicit `depends:` links. The planned evolution is register-driven barrier execution: the coordinator infers dependencies from register ownership, removing the need for explicit `depends:` as the primary mechanism. See ROADMAP.md for motivation and priorities.
 
 ### Data Model: The Register Map
 
@@ -127,33 +124,55 @@ LinearJC uses a **register map** model inspired by mainframe datasets:
 
 Typical data flow:
 ```
-[fs protected input] → job1 → [temp intermediate] → job2 → [fs output]
+[fs protected input] -> job1 -> [temp intermediate] -> job2 -> [fs output]
 ```
 
-**Register Types:**
+#### Register Types
 
 | Type | Storage | Persistence | Locking | Use Case |
 |------|---------|-------------|---------|----------|
 | `fs` | Filesystem | Permanent | ENQ/DEQ | Managed outputs, external inputs |
-| `temp` | MinIO temp | Chain duration | None (unique path) | Intermediates between jobs |
+| `fs` + `protect` | Filesystem | Permanent | Shared only | External read-only inputs |
+| `temp` | MinIO temp | Tree duration | None (unique path) | Intermediates between jobs |
 | `minio` | MinIO bucket | Permanent | ENQ/DEQ | Large objects, cross-system |
 
-Temp registers enable parallel fan-out by giving each tree execution its own MinIO path. They're automatically cleaned when the tree completes.
+**`type: fs`** - Filesystem register:
+- `path`: Absolute filesystem path (required)
+- `kind`: `file` (single file) or `dir` (directory)
+- `protect`: If `true`, register is read-only (external input, must exist at startup)
+- Write-through semantics: job output -> MinIO temp -> collected to filesystem path
+
+**`type: temp`** - Temporary register:
+- No filesystem path - lives only in MinIO during tree execution
+- Automatically cleaned when tree completes or fails
+- Enables parallel fan-out (each tree gets unique MinIO path)
+- MinIO path convention: `jobs/{tree_exec_id}/output_{registry_key}.tar.gz`
+
+**`type: minio`** - Permanent MinIO register:
+- `bucket`: MinIO bucket name (required, S3 naming rules)
+- `prefix`: Object prefix within bucket (optional)
+- `kind`: `file` or `dir`
+- Write-through: server-side copy from temp to permanent bucket
+
+**`kind` field (all types):**
+- `file`: Single file (archive must contain exactly one file, validated at extraction)
+- `dir`: Directory with contents (preserves structure)
 
 ### Batch Generations
 
 A batch generation is one scheduled or manual execution of a batch group. Temp registers are scoped to that generation so downstream modules never mix outputs from different runs.
 
 Example:
-
 ```
 generation daily.close-20260113-000001
-├── sales_extract       from extract.sales
-├── inventory_extract   from extract.inventory
-└── daily_report        from build.report
+  sales_extract       from extract.sales
+  inventory_extract   from extract.inventory
+  daily_report        from build.report
 ```
 
-For future barrier jobs, generation scoping is what makes multi-input consolidation safe: `build.report` must consume `sales_extract` and `inventory_extract` from the same generation, not whichever register was most recently written.
+Generation scoping is what makes multi-input consolidation safe: a barrier job must consume inputs from the same generation, not whichever register was most recently written.
+
+**Note**: Generation tracking is not yet implemented at runtime. The current implementation uses tree execution IDs for temp register scoping within a single chain, but does not enforce cross-chain generation consistency. See ROADMAP.md priority 2.
 
 ---
 
@@ -163,16 +182,16 @@ For future barrier jobs, generation scoping is what makes multi-input consolidat
 
 ```
 my-jobs/
-├── registry.yaml        # All register definitions
-├── jobs/
-│   └── <job-id>/
-│       ├── job.yaml     # Job definition
-│       ├── script.sh    # Entry script
-│       ├── bin/         # Optional bundled binaries
-│       ├── data/        # Optional bundled static data
-│       └── test/        # Optional test inputs (excluded from package)
-├── dist/                # Built .ljc packages
-└── .ljcconfig           # Tool configuration
+  registry.yaml        # All register definitions
+  jobs/
+    <job-id>/
+      job.yaml          # Job definition
+      script.sh         # Entry script
+      bin/               # Optional bundled binaries
+      data/              # Optional bundled static data
+      test/              # Optional test inputs (excluded from package)
+  dist/                  # Built .ljc packages
+  .ljcconfig             # Tool configuration
 ```
 
 ### Registry (registry.yaml)
@@ -205,17 +224,6 @@ registry:
 | `temp` | `kind` | - | Chain-only MinIO storage. Auto-cleaned on completion |
 | `minio` | `bucket`, `kind` | `prefix` | Permanent MinIO storage |
 
-**`kind` field (all types):**
-- `file`: Single file (archive must contain exactly one file)
-- `dir`: Directory with contents (preserves structure)
-
-**`protect` flag (fs only):**
-- `protect: true`: External input that jobs cannot write to
-  - Validated at startup (must exist)
-  - Jobs can read but cannot declare in `writes:`
-  - Use for databases, configs managed by other systems
-- `protect: false` (default): Managed by LinearJC jobs
-
 **Rules:**
 - Register names must be unique
 - Filesystem paths must not overlap
@@ -232,25 +240,25 @@ job:
   version: 1.0.0
 
   reads:  [sensor_raw, sensor_config]    # Input registers
-  writes: [sensor_parsed]                 # Output register (this job owns it)
+  writes: [sensor_parsed]                # Output register (this job owns it)
 
-  depends: []                             # Current chain predecessor; data contracts are primary
+  depends: []                            # Chain predecessor (current execution model)
 
   schedule:
-    min_daily: 1                          # Minimum executions per 24h
-    max_daily: 5                          # Maximum executions per 24h
+    min_daily: 1                         # Minimum executions per 24h
+    max_daily: 5                         # Maximum executions per 24h
 
   run:
-    user: nobody                          # Execution user
-    timeout: 300                          # Seconds
-    entry: script.sh                      # Entry script (default: script.sh)
-    binaries: [bin/processor]             # Optional bundled binaries
+    user: nobody                         # Execution user
+    timeout: 300                         # Seconds
+    entry: script.sh                     # Entry script (default: script.sh)
+    binaries: [bin/processor]            # Optional bundled binaries
 
     # Process isolation (all optional, shown with defaults)
-    isolation: none                       # strict | relaxed | none
-    network: true                         # Allow network access
-    # extra_read_paths: []                # For relaxed mode only
-    # limits:                             # Resource limits (cgroups v2)
+    isolation: none                      # strict | relaxed | none
+    network: true                        # Allow network access
+    # extra_read_paths: []               # For relaxed mode only
+    # limits:                            # Resource limits (cgroups v2)
     #   cpu_percent: 100
     #   memory_mb: 512
     #   processes: 100
@@ -264,8 +272,8 @@ job:
 | `version` | Yes | Semantic version (X.Y.Z) |
 | `reads` | Yes | List of input register names |
 | `writes` | Yes | List of output register names (job owns these) |
-| `depends` | No | Current chain predecessor field (max 1 for linear chains). Future barrier execution derives dependencies from `reads:`/`writes:` and may use `depends` only as a validation assertion. |
-| `schedule.min_daily` | Yes | Minimum runs per 24h sliding window |
+| `depends` | No | Chain predecessor (max 1 for current linear chains). Planned to become a validation assertion when register-driven scheduling replaces explicit dependencies. |
+| `schedule.min_daily` | Yes | Minimum runs per 24h sliding window (must be >= 1) |
 | `schedule.max_daily` | Yes | Maximum runs per 24h sliding window |
 | `run.user` | Yes | Unix user to run script as |
 | `run.timeout` | Yes | Maximum execution time in seconds |
@@ -278,34 +286,32 @@ job:
 | `run.limits.memory_mb` | No | Memory limit in megabytes |
 | `run.limits.processes` | No | Maximum process count |
 
-### Dependency Chains, Fan-Out, and Barrier Direction
+### Current Execution Model: Chains and Fan-Out
 
-The current implementation builds execution trees from explicit `depends:` links. This supports linear chains and fan-out while preserving simple operational behavior.
+The current implementation builds execution trees from explicit `depends:` links. This supports linear chains and fan-out.
 
-Jobs can form **linear chains** where one job depends on another:
+**Linear chains** where one job depends on another:
 
 ```yaml
-# Linear chain: A → B → C
+# Linear chain: A -> B -> C
 - id: job.a
   depends: []
   writes: [output_a]
 
 - id: job.b
-  depends: [job.a]     # Runs after job.a completes
+  depends: [job.a]
   reads: [output_a]
   writes: [output_b]
 
 - id: job.c
-  depends: [job.b]     # Runs after job.b completes
+  depends: [job.b]
   reads: [output_b]
 ```
 
-**Fan-Out Support:**
-
-If multiple jobs depend on the same job, separate execution trees are created:
+**Fan-out** where multiple jobs depend on the same job creates separate trees:
 
 ```yaml
-# Fan-out: A → B and A → C (two trees)
+# Fan-out: A -> B and A -> C (two separate trees)
 - id: process.data
   depends: []
   writes: [processed]
@@ -317,72 +323,34 @@ If multiple jobs depend on the same job, separate execution trees are created:
   depends: [process.data]  # Tree 2: [process.data, export.report]
 ```
 
-In this example, `process.data` **runs twice** - once for each consuming tree. This is useful when:
-- The upstream job is fast/cheap
-- You want failure isolation between branches
-- Downstream jobs have different schedules
-
-**Parallel Fan-Out with Temp Registers:**
-
-Using `type: temp` for the shared output enables true parallel execution:
-
-```yaml
-registry:
-  processed: {type: temp, kind: file}  # Not type: fs!
-
-jobs:
-  - id: process.data
-    writes: [processed]   # Each tree gets unique MinIO path
-
-  - id: analyze.spending
-    depends: [process.data]
-    reads: [processed]    # Reads from tree-1's MinIO path
-
-  - id: export.report
-    depends: [process.data]
-    reads: [processed]    # Reads from tree-2's MinIO path
-```
-
-With `type: temp`, both fan-out trees can execute in parallel because each gets a unique MinIO path. With `type: fs`, trees would serialize (one holds exclusive lock, other waits).
+In fan-out, `process.data` **runs once per consuming tree**. This is a known limitation for expensive root jobs - see ROADMAP.md priority 1.
 
 **Constraints:**
 - Each job can depend on **at most one** other job (no merge points)
-- Cycles are not allowed (A → B → A)
+- Cycles are not allowed
 - Tree schedules use the most restrictive min/max from all jobs in the chain
 
-### Planned: Multi-Input Barrier Jobs
+### Planned: Register-Driven Barrier Execution
 
-Some batch results are produced from multiple upstream modules. The user-facing model should remain register-driven: the downstream job declares the registers it reads, and the coordinator infers that it must wait for the modules that own those registers.
+The planned execution model replaces explicit `depends:` with dependency inference from register ownership. Multi-input barriers emerge naturally:
 
 ```yaml
-registry:
-  source_sales:       {type: fs, path: /data/source/sales.csv, kind: file, protect: true}
-  source_inventory:   {type: fs, path: /data/source/inventory.csv, kind: file, protect: true}
-  sales_extract:      {type: temp, kind: file}
-  inventory_extract:  {type: temp, kind: file}
-  daily_report:       {type: fs, path: /data/reports/daily.csv, kind: file}
+- id: extract.sales
+  reads: [source_sales]
+  writes: [sales_extract]
 
-jobs:
-  - id: extract.sales
-    reads: [source_sales]
-    writes: [sales_extract]
+- id: extract.inventory
+  reads: [source_inventory]
+  writes: [inventory_extract]
 
-  - id: extract.inventory
-    reads: [source_inventory]
-    writes: [inventory_extract]
-
-  - id: build.report
-    reads: [sales_extract, inventory_extract]
-    writes: [daily_report]
+- id: build.report
+  reads: [sales_extract, inventory_extract]
+  writes: [daily_report]
 ```
 
-`build.report` is a barrier job. It is eligible only when:
+`build.report` is a barrier job. The coordinator infers that it must wait for `extract.sales` and `extract.inventory` because they own the registers that `build.report` reads. Each job runs once per batch generation. No fan-out duplication.
 
-1. `sales_extract` is ready for the current batch generation.
-2. `inventory_extract` is ready for the current batch generation.
-3. `daily_report` can be exclusively locked.
-
-This avoids two sources of truth. Users should not have to write both `reads: [sales_extract, inventory_extract]` and `depends: [extract.sales, extract.inventory]` as primary configuration. If retained, multi-value `depends:` should be treated as an assertion that the inferred register dependencies are what the author intended.
+This is not implemented. See ROADMAP.md for the architectural transition plan.
 
 ### Workdir Structure
 
@@ -390,41 +358,32 @@ When a job executes, the executor creates a **workdir** with a fixed, predictabl
 
 ```
 {workdir}/
-├── script.sh            # Entry script (from package)
-├── bin/                 # Bundled binaries (from package)
-│   └── processor
-├── data/                # Bundled static data (from package)
-│   └── template.json
-├── in/                  # Inputs (populated by executor, read-only)
-│   ├── sensor_raw/      # Directory input (kind: dir)
-│   └── sensor_config    # File input (kind: file)
-├── out/                 # Outputs (job writes here)
-└── tmp/                 # Scratch space (job can use freely)
+  script.sh            # Entry script (from package)
+  bin/                  # Bundled binaries (from package)
+    processor
+  data/                 # Bundled static data (from package)
+    template.json
+  in/                   # Inputs (populated by executor, read-only)
+    sensor_raw/          # Directory input (kind: dir)
+    sensor_config        # File input (kind: file)
+  out/                  # Outputs (job writes here)
+  tmp/                  # Scratch space (job can use freely)
 ```
 
 **Key design points:**
 - Script always executes from workdir root
-- All paths are **relative** - no environment variables needed for I/O
+- All paths are **relative** - scripts use `in/`, `out/`, `tmp/`, `bin/`, `data/`
 - Register names become paths: `in/{register_name}`, `out/{register_name}`
 - With Landlock isolation, script cannot access anything outside workdir (except system libs)
 
-### Entry Script (script.sh)
-
-The entry script is the job's executable entry point.
-
-**Requirements:**
-- Must have a valid shebang (`#!/bin/sh`, `#!/usr/bin/python3`, etc.)
-- Must exit 0 on success, non-zero on failure
-- Must validate outputs exist before exiting 0
-
-**Environment Variables (minimal, for identification only):**
+**Environment Variables (identification only):**
 
 | Variable | Description |
 |----------|-------------|
 | `LINEARJC_JOB_ID` | Job identifier (e.g., `process.daily`) |
-| `LINEARJC_EXECUTION_ID` | Unique execution ID (e.g., `process.daily-20251125-143022-a1b2`) |
+| `LINEARJC_EXECUTION_ID` | Unique execution ID |
 
-**Note:** No path environment variables. Scripts use relative paths (`in/`, `out/`, `tmp/`, `bin/`, `data/`).
+**Note:** No path environment variables. Scripts use relative paths.
 
 **Example script:**
 
@@ -441,29 +400,14 @@ CONFIG=$(cat in/sensor_config)
     --input in/sensor_raw \
     --output out/sensor_parsed
 
-# Use bundled data if needed
-./bin/processor --template data/template.json ...
-
-# Use scratch space
-cp in/sensor_raw/* tmp/
-# ... process in tmp/ ...
-
 # Validate output exists
 [ -d out/sensor_parsed ] || exit 1
 exit 0
 ```
 
-**Why relative paths?**
-1. Simpler scripts - no env var ceremony
-2. Works naturally with Landlock - strict mode prevents leaving workdir anyway
-3. Predictable structure - same in development and production
-4. Like Docker containers - fixed workdir layout, scripts just use it
-
 ### Process Isolation
 
 Jobs can opt into kernel-level isolation for security:
-
-**Isolation Modes:**
 
 | Mode | Filesystem Access | Description |
 |------|-------------------|-------------|
@@ -492,68 +436,19 @@ Jobs can opt into kernel-level isolation for security:
 | `limits.memory_mb` | Memory limit (cgroups v2) |
 | `limits.processes` | Process count limit (prevents fork bombs) |
 
-**Example with full isolation:**
-
-```yaml
-run:
-  user: nobody
-  timeout: 300
-  isolation: strict
-  network: false
-  limits:
-    cpu_percent: 50
-    memory_mb: 512
-    processes: 10
-```
-
-**Example with relaxed mode (needs extra paths):**
-
-```yaml
-run:
-  user: nobody
-  timeout: 300
-  isolation: relaxed
-  extra_read_paths:
-    - /usr/local/share/geoip    # GeoIP database
-    - /etc/ssl/certs            # SSL certificates
-  network: true
-```
-
-**Implementation Note:** Isolation validation code should be shared between `ljc` and the executor to ensure consistent behavior during local testing and production execution.
-
 ### Package Format (.ljc)
 
 The `.ljc` package is a gzip-compressed tar archive containing:
 
 ```
 package.ljc (tar.gz)
-├── job.yaml             # Job definition (for coordinator)
-├── script.sh            # Entry script (executable)
-├── bin/                 # Optional bundled binaries
-│   └── processor
-└── data/                # Optional bundled static data
-    └── template.json
+  job.yaml             # Job definition (for coordinator)
+  script.sh            # Entry script (executable)
+  bin/                  # Optional bundled binaries
+  data/                 # Optional bundled static data
 ```
 
-**Extraction to workdir:**
-
-The executor extracts the package and adds I/O directories:
-
-```
-Package contents     →    Workdir
-─────────────────         ───────────────────
-script.sh            →    script.sh
-bin/                 →    bin/
-data/                →    data/
-job.yaml             →    (not extracted, coordinator only)
-                          in/       (created by executor)
-                          out/      (created by executor)
-                          tmp/      (created by executor)
-```
-
-**Excluded from package:**
-- `test/` directory (local testing data)
-- `job.yaml` is included in package but not extracted to workdir (coordinator metadata)
+The executor extracts the package to the workdir and adds I/O directories (`in/`, `out/`, `tmp/`). The `test/` directory is excluded from packages.
 
 ### Commands
 
@@ -573,19 +468,13 @@ ljc registry add <name> \          # Add new register
     --type fs \
     --path /var/share/foo \
     --kind file
-ljc registry add <name> \          # Add MinIO register
-    --type minio \
-    --bucket linearjc \
-    --prefix foo/
 ljc registry push                  # Push registry to coordinator
 ```
 
 #### Job Development
 
 ```bash
-ljc new <job-id> \                 # Create new job
-    --reads reg1,reg2 \
-    --writes reg3
+ljc new <job-id>                   # Create new job
 ljc validate [job-id | --all]      # Validate job(s)
 ljc build <job-id>                 # Build .ljc package
 ljc bump <major|minor|patch> \     # Bump version
@@ -596,142 +485,48 @@ ljc bump <major|minor|patch> \     # Bump version
 
 ```bash
 ljc test <job-id>                  # Run job locally with test/ inputs
-ljc test <job-id> --isolation none # Override isolation (iterative hardening)
+ljc test <job-id> --isolation none # Override isolation
 ljc test <job-id> --verbose        # Show script stdout/stderr
-ljc extract <package.ljc>          # Extract package to workdir (manual testing)
+ljc extract <package.ljc>          # Extract package to workdir
 ```
 
-**`ljc test` - Local Job Execution**
+`ljc test` runs a job locally using the same `linearjc-core` code as the production executor. Override flags: `--isolation`, `--network`, `--timeout`, `--user`, `--cpu`, `--memory`, `--keep` (preserve workdir), `--validate` (diff against `test/expected/`).
 
-Runs a job locally using the same `linearjc-core` code as the production executor.
-
-**Basic usage:**
-```bash
-# Use job.yaml defaults
-ljc test process.daily
-
-# Iterative hardening workflow
-ljc test process.daily --isolation none      # Start: no restrictions
-ljc test process.daily --isolation relaxed   # Add Landlock with extras
-ljc test process.daily --isolation strict    # Full lockdown
-ljc test process.daily --network no          # Disable network
-```
-
-**Override flags** (override job.yaml settings for testing):
-
-| Flag | Description |
-|------|-------------|
-| `--isolation <mode>` | Override isolation: `strict`, `relaxed`, `none` |
-| `--network <yes\|no>` | Override network access |
-| `--timeout <seconds>` | Override timeout |
-| `--user <user>` | Override execution user |
-| `--cpu <percent>` | Override CPU limit |
-| `--memory <mb>` | Override memory limit |
-| `--verbose` | Show script stdout/stderr |
-| `--keep` | Keep workdir after execution (for debugging) |
-| `--validate` | Compare `out/` against `test/expected/` |
-
-**What `ljc test` does:**
-
-1. Read `jobs/<job-id>/job.yaml`
-2. Create temporary workdir:
-   ```
-   {tempdir}/
-   ├── script.sh      ← from jobs/<job-id>/
-   ├── bin/           ← from jobs/<job-id>/bin/
-   ├── data/          ← from jobs/<job-id>/data/
-   ├── in/            ← from jobs/<job-id>/test/in/
-   ├── out/           ← created empty
-   └── tmp/           ← created empty
-   ```
-3. Apply isolation (Landlock, cgroups, namespaces) using `linearjc-core`
-4. Execute script from workdir
-5. Report: exit code, runtime, files created
-6. If `--validate`: diff `out/` against `test/expected/`
-7. Cleanup workdir (unless `--keep`)
-
-**Test directory structure:**
-
-Jobs include a `test/` directory with sample inputs (excluded from package):
-
-```
-jobs/process.daily/
-├── job.yaml
-├── script.sh
-├── bin/
-├── data/
-└── test/                          # Excluded from .ljc package
-    ├── in/                        # Sample inputs (must match job.reads)
-    │   ├── sensor_raw/            # Directory register
-    │   │   └── sample.csv
-    │   └── sensor_config          # File register
-    └── expected/                  # Optional: expected outputs
-        └── sensor_parsed/
-            └── output.json
-```
-
-**Platform requirements:**
-
-| Feature | Requirement |
-|---------|-------------|
-| Basic execution | Any Unix (Linux, macOS) |
-| `--isolation strict/relaxed` | Linux 5.13+ (Landlock) |
-| `--network no` | Linux (network namespaces) |
-| Resource limits | Linux (cgroups v2) |
-
-On unsupported platforms, `ljc test` warns and skips unavailable features.
-
-**`ljc extract` - Manual Testing**
-
-For manual inspection or debugging:
+#### Deployment and Operations
 
 ```bash
-ljc extract dist/process.daily.ljc -o ./workdir
-cd ./workdir
-# Manually populate in/ with test data
-./script.sh
-# Inspect out/
-```
-
-#### Deployment
-
-```bash
-ljc deploy <package.ljc> \         # Deploy to coordinator
-    --to <coordinator-host>
+ljc deploy <package.ljc> --to <host>  # Deploy to coordinator
+ljc exec <job-id> [--follow]          # Trigger immediate execution
+ljc status [job-id]                   # Query scheduling status
+ljc ps                                # List active executions
+ljc tail <job-id>                     # Follow running execution
+ljc logs <job-id>                     # Execution history
+ljc kill <exec-id>                    # Cancel execution
+ljc self-update [--check]             # Update ljc from coordinator
 ```
 
 ### Validation Rules
 
-`ljc validate` performs comprehensive pre-deployment validation:
+`ljc validate` checks before deployment:
 
-**Registry Validation:**
-- All entries have valid type and required fields
-- No duplicate register names
-- Filesystem paths do not overlap
-
-**Job Validation:**
-- All `reads` registers exist in registry
-- All `writes` registers exist in registry
-- No two jobs write to same register (single writer rule)
-- Dependencies reference existing jobs
-- Dependency graph is acyclic
-- Script has valid shebang
-- Declared binaries exist
-- Version is valid semantic version
-
-**Cross-Job Validation:**
-- No output register conflicts across all jobs
-- Dependency chains are satisfiable
+| Rule | Description |
+|------|-------------|
+| All `reads` registers exist in registry | Missing input |
+| All `writes` registers exist in registry | Missing output |
+| No `writes` to protected registers | Cannot overwrite external inputs |
+| No duplicate writes across jobs | Single writer rule |
+| Script has valid shebang | Executor uses shebang directly |
+| Version is valid semver | Required for deployment |
+| `min_daily >= 1` | Use `ljc exec` for on-demand |
 
 ### Configuration (.ljcconfig)
 
 ```yaml
 coordinator:
   host: 192.0.2.10
-  mqtt_port: 1884
-
-auth:
-  shared_secret: ${LINEARJC_SECRET}    # From environment
+  mqtt_port: 1883
+signing:
+  secret_env: LINEARJC_SECRET
 ```
 
 ---
@@ -744,40 +539,21 @@ The coordinator is the central scheduler. It receives job packages from `ljc`, m
 
 **Design principle:** The coordinator is "dumb" - it stores validated artifacts, enforces schedules, and moves data. Complex logic lives in `ljc` (validation) and `linearjc-core` (execution).
 
-### Target Register-Driven Scheduling
+### Current Scheduling Model
 
-Inspired by mainframe JCL, LinearJC's target model is **register-driven scheduling**:
+The current coordinator builds execution trees from explicit `depends:` links, then schedules trees as units:
 
-- Jobs declare what data they `read` and `write`
-- Scheduler infers dependencies from register ownership
-- Jobs run when: schedule permits AND inputs available AND outputs unlocked
+1. Discover jobs from `jobs_dir`, build dependency trees
+2. For each tree, check schedule constraints (min/max daily, sliding window)
+3. Acquire register locks (all-or-nothing, sorted order)
+4. Find capable executor via heartbeat registry
+5. Dispatch root job to executor
+6. On completion, dispatch next job in chain (chain continuation)
+7. On tree completion, collect outputs (write-through) and release locks
 
-Current releases implement linear chains and fan-out with explicit `depends:` links. The target model below removes duplicated dependency declarations: fan-out and multi-input barriers emerge from `reads:`/`writes:`.
+### Planned: Register-Driven Scheduling
 
-```yaml
-# Fan-out: multiple jobs read same register
-ingest:
-  writes: [raw_data]
-  schedule: {min_daily: 24}
-
-process_a:
-  reads: [raw_data]      # Waits for ingest
-  writes: [output_a]
-  schedule: {min_daily: 24}
-
-process_b:
-  reads: [raw_data]      # Also waits for ingest, can run parallel with process_a
-  writes: [output_b]
-  schedule: {min_daily: 24}
-
-# Multi-input barrier: job reads from multiple sources
-build_report:
-  reads: [output_a, output_b]   # Waits for BOTH
-  writes: [daily_report]
-  schedule: {min_daily: 24}
-```
-
-### Scheduling Logic
+The target model infers dependencies from register ownership:
 
 ```
 For each job, check if runnable:
@@ -785,67 +561,54 @@ For each job, check if runnable:
 1. SCHEDULE CHECK
    - Time since last run >= min_interval (24h / max_daily)?
    - Executions in last 24h < max_daily?
-   → If no: skip (not time yet)
 
 2. INPUT CHECK
-   - All registers in `reads` have data?
-   - All registers in `reads` are unlocked (no active writer)?
-   → If no: skip (inputs not ready)
+   - All registers in reads have data?
+   - All registers in reads are unlocked (no active writer)?
 
 3. OUTPUT CHECK
-   - All registers in `writes` are unlocked?
-   → If no: skip (would conflict)
+   - All registers in writes are unlocked?
 
 4. If all checks pass: job is READY
-
-Ready jobs dispatched to available executors.
 ```
 
-### Job Lifecycle
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Job States                                                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  IDLE ──schedule──► READY ──dispatch──► ASSIGNED                │
-│    ▲                                        │                   │
-│    │                                        ▼                   │
-│    │                                   DOWNLOADING              │
-│    │                                        │                   │
-│    │                                        ▼                   │
-│    │                                    RUNNING                 │
-│    │                                        │                   │
-│    │                      ┌─────────────────┼─────────────────┐ │
-│    │                      ▼                 ▼                 ▼ │
-│    └───────────────── COMPLETED          FAILED           TIMEOUT│
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+This removes the need for explicit `depends:` as the primary mechanism. Fan-out and multi-input barriers emerge from register ownership. Each job runs once per batch generation. Not yet implemented - see ROADMAP.md.
 
 ### Register Locking (ENQ/DEQ)
 
-LinearJC uses mainframe-style ENQ/DEQ locking for data integrity:
+LinearJC uses mainframe-style ENQ/DEQ locking for data integrity.
 
 **Lock Types:**
+
 | Mode | Compatibility | Use |
 |------|---------------|-----|
 | **Shared (S)** | Compatible with other Shared | `reads:` registers |
 | **Exclusive (E)** | Incompatible with all | `writes:` registers |
 
 **Compatibility Matrix:**
+
 | Held \ Requested | Shared | Exclusive |
 |------------------|--------|-----------|
 | **None** | Grant | Grant |
 | **Shared** | Grant | Wait |
 | **Exclusive** | Wait | Wait |
 
+**Hazard Detection:**
+
+| Hazard | Scenario | Resolution |
+|--------|----------|------------|
+| RAW (Read-After-Write) | Tree B reads register X while Tree A writes X | B waits for A |
+| WAW (Write-After-Write) | Tree B writes register X while Tree A writes X | B waits for A |
+| WAR (Write-After-Read) | Tree B writes register X while Tree A reads X | B waits for A |
+
 **Lock Acquisition:**
 - **All-or-nothing**: Tree acquires ALL locks or NONE (prevents partial holds)
 - **Sorted ordering**: Locks acquired in canonical path order (prevents deadlock)
 - **FIFO queue**: Waiting trees served in arrival order (prevents starvation)
+- **Shared batching**: Consecutive shared waiters in queue are granted together
 
 **Lock Scope by Type:**
+
 | Register Type | Locking |
 |---------------|---------|
 | `fs` | ENQ/DEQ (exclusive for writes, shared for reads) |
@@ -853,25 +616,27 @@ LinearJC uses mainframe-style ENQ/DEQ locking for data integrity:
 | `temp` | None (unique MinIO path per tree execution) |
 | `minio` | ENQ/DEQ (exclusive for writes, shared for reads) |
 
+**Lock Path Resolution:**
+- `fs`: resolved absolute filesystem path
+- `minio`: `minio:{bucket}/{prefix}`
+- `temp`: no lock path (returns None)
+
 **Lock Lifecycle:**
 1. **Tree start:** Acquire all locks (reads=shared, writes=exclusive)
 2. **During execution:** Hold locks for entire tree duration
-3. **Tree completion:** Release all locks (DEQ)
+3. **Tree completion:** Release all locks (DEQ), process wait queue
 4. **Tree failure/timeout:** Release all locks, cleanup
 
 **Executor Crash Detection:**
 - Executors send heartbeat every 30 seconds
 - After 3 missed heartbeats (90s): executor presumed dead
 - All locks held by dead executor's trees are immediately released
-- This prevents hour-long lock holds when executor crashes early
 
-```
-Register: /data/reports/daily.csv
-├── State: EXCLUSIVE
-├── Locked by: report.daily-20260113-143022-a1b2
-├── Acquired: 2026-01-13T14:30:22Z
-└── Queue: [analyze.data-... (waiting shared)]
-```
+**Coordinator Restart:**
+- Lock state is purely in-memory
+- Restart clears all locks and MinIO temp data (clean slate)
+- Running jobs on executors become orphaned; executors detect absence and stop
+- Simpler than lock reconstruction, acceptable for rare restart events
 
 ### Input/Output Flow
 
@@ -879,50 +644,36 @@ Register: /data/reports/daily.csv
 
 ```
 For each register in job.reads:
-  If type: fs
-    → Archive path to tar.gz
-    → Upload to MinIO temp bucket
-    → Generate presigned GET URL
-  If type: minio
-    → Generate presigned GET URL directly
-  If type: temp (chain job)
-    → Generate presigned GET URL from MinIO temp
+  If type: fs    -> Archive path to tar.gz, upload to MinIO temp, generate presigned GET URL
+  If type: minio -> Generate presigned GET URL directly
+  If type: temp  -> Generate presigned GET URL from MinIO temp
 ```
 
 **Before execution (coordinator prepares outputs):**
 
 ```
 For each register in job.writes:
-  → Generate presigned PUT URL (MinIO temp bucket)
+  -> Generate presigned PUT URL (MinIO temp bucket)
 ```
 
 **Write-Through Collection (after EACH job in chain):**
 
 ```
 For each register in completed_job.writes:
-  If type: fs
-    → Download archive from MinIO temp
-    → Extract atomically (temp dir + os.replace)
-    → Keep MinIO data as cache for chain
-  If type: minio
-    → Server-side copy to permanent bucket
-    → Keep temp data as cache for chain
-  If type: temp
-    → No action (stays in MinIO for chain)
+  If type: fs    -> Download archive from MinIO temp, extract atomically to path
+  If type: minio -> Server-side copy to permanent bucket
+  If type: temp  -> No action (stays in MinIO for chain)
 ```
 
 **Cache-Aware Chain Input Preparation:**
 
 ```
 For next job in chain reading from previous job's output:
-  If type: temp
-    → Read from MinIO temp (no fallback)
-  If type: fs or minio
-    → Try MinIO cache (fast path)
-    → Fallback to storage if cache miss
+  If type: temp       -> Read from MinIO temp (no fallback)
+  If type: fs or minio -> Try MinIO cache first, fallback to storage
 ```
 
-**Tree Finalization (after last job):**
+**Tree Finalization:**
 
 ```
 1. Release all ENQ/DEQ locks
@@ -930,7 +681,21 @@ For next job in chain reading from previous job's output:
 3. Clean up work directory
 ```
 
-This write-through design ensures permanent outputs are safely on disk after each job, while temp outputs provide fast intermediate storage.
+### Job Lifecycle
+
+```
+IDLE --schedule--> READY --dispatch--> ASSIGNED
+  ^                                       |
+  |                                       v
+  |                                  DOWNLOADING
+  |                                       |
+  |                                       v
+  |                                   RUNNING
+  |                                       |
+  |                     +-----------------+-----------------+
+  |                     v                 v                 v
+  +---------------- COMPLETED          FAILED           TIMEOUT
+```
 
 ### Job Dispatch
 
@@ -955,72 +720,50 @@ Coordinator sends to executor via MQTT:
 }
 ```
 
-**Note:** Executor config (user, timeout, isolation) is inside the .ljc package. Coordinator doesn't need to send it separately.
+Executor config (user, timeout, isolation) is inside the .ljc package. Coordinator does not send it separately.
 
 ### MQTT Topics
 
 | Direction | Topic | Purpose |
 |-----------|-------|---------|
-| Coordinator → Executor | `linearjc/jobs/dispatch/{executor_id}` | Job assignment |
-| Executor → Coordinator | `linearjc/jobs/progress/{job_execution_id}` | State updates |
-| Developer → Coordinator | `linearjc/deploy/request` | Package deployment |
-| Coordinator → Developer | `linearjc/deploy/response/{client_id}` | Deploy result |
-| Coordinator → All | `linearjc/coordinator/online` | Coordinator startup (triggers heartbeats) |
-| Executor → Coordinator | `linearjc/heartbeat/{executor_id}` | Periodic capability push (30s) |
-| ljc → Coordinator | `linearjc/tools/version/request/{coordinator_id}` | Tool version query |
-| Coordinator → ljc | `linearjc/tools/version/response/{client_id}` | Version info + download URL |
-| Coordinator → Executor | `linearjc/executors/{executor_id}/update` | Executor auto-update command |
+| Coordinator -> Executor | `linearjc/jobs/dispatch/{executor_id}` | Job assignment |
+| Executor -> Coordinator | `linearjc/jobs/progress/{job_execution_id}` | State updates |
+| Developer -> Coordinator | `linearjc/deploy/request` | Package deployment |
+| Coordinator -> Developer | `linearjc/deploy/response/{client_id}` | Deploy result |
+| Coordinator -> All | `linearjc/coordinator/online` | Coordinator startup |
+| Executor -> Coordinator | `linearjc/heartbeat/{executor_id}` | Periodic heartbeat (30s) |
+| ljc -> Coordinator | `linearjc/tools/version/request/{coordinator_id}` | Tool version query |
+| Coordinator -> ljc | `linearjc/tools/version/response/{client_id}` | Version info |
+| Coordinator -> Executor | `linearjc/executors/{executor_id}/update` | Auto-update command |
 
 All messages signed with HMAC-SHA256 (shared secret).
 
 ### Package Storage
 
-Coordinator stores .ljc packages received via `ljc deploy`:
-
 ```
 /var/lib/linearjc/
-├── packages/
-│   ├── ingest.ljc
-│   ├── process.ljc
-│   └── backup.ljc
-├── registry.yaml           # Pushed from ljc
-└── state/
-    └── schedules.yaml      # Last run times, execution counts
+  packages/
+    ingest.ljc
+    process.ljc
+  registry.yaml           # Pushed from ljc
+  state/
+    schedules.yaml         # Last run times, execution counts
 ```
-
-**On package install:**
-1. Receive .ljc via MQTT (presigned upload to MinIO)
-2. Download and validate
-3. Extract job.yaml, parse for: id, version, reads, writes, schedule
-4. Store .ljc in packages/
-5. Update internal job index
-6. SIGHUP: reload without restart (with safety validation)
 
 ### Hot Reload (SIGHUP)
 
-The coordinator supports hot reload via SIGHUP signal. Registry and job changes are validated before applying.
-
-**Safety Validation (Phase 15):**
+The coordinator supports hot reload. Registry and job changes are validated before applying:
 
 | Change Type | Active Locks | Behavior |
 |-------------|--------------|----------|
-| Add new register | Any | ✅ Allowed |
-| Remove register | Has lock | ❌ Blocked |
-| Change path | Has lock | ⚠️ Warning (orphaned lock) |
-| Change type | Has lock | ❌ Blocked |
-| Add `protect: true` | Has exclusive | ❌ Blocked (writer mid-write) |
-| Add `protect: true` | Has shared | ✅ Allowed |
-| Remove `protect: true` | Has shared | ❌ Blocked (readers expect immutable) |
-| Remove `protect: true` | Has exclusive | ✅ Allowed |
-
-**Process:**
-1. Load new registry to temporary variable
-2. Validate changes against current lock state
-3. If blocked: abort reload, log errors
-4. If warnings: log and proceed
-5. Apply registry, rebuild trees, preserve scheduling state
-
-**Coordinator restart** (clean slate): All locks cleared, MinIO temp cleaned, executors reconnect.
+| Add new register | Any | Allowed |
+| Remove register | Has lock | Blocked |
+| Change path | Has lock | Warning (orphaned lock) |
+| Change type | Has lock | Blocked |
+| Add `protect: true` | Has exclusive | Blocked |
+| Add `protect: true` | Has shared | Allowed |
+| Remove `protect: true` | Has shared | Blocked |
+| Remove `protect: true` | Has exclusive | Allowed |
 
 ### Coordinator Configuration
 
@@ -1047,43 +790,30 @@ coordinator:
     state_file: /var/lib/linearjc/state/schedules.yaml
 
   scheduling:
-    loop_interval: 10        # Seconds between scheduler runs
-    lock_timeout: 3600       # Auto-release locks after 1h
+    loop_interval: 10
+    lock_timeout: 3600
 
   signing:
     shared_secret: ${LINEARJC_SECRET}
 
   security:
-    allowed_data_roots:      # fs registers must be under these paths
+    allowed_data_roots:
       - /var/share
       - /data
+
+  tools_registry: /var/lib/linearjc/tools-registry.yaml
 ```
 
-### CLI Commands
-
-```bash
-# Main operation
-linearjc-coordinator run                    # Start scheduler loop
-
-# Management
-linearjc-coordinator status                 # Show jobs, schedules, locks
-linearjc-coordinator install <package.ljc>  # Manual package install
-
-# Maintenance
-linearjc-coordinator cleanup --age 24h      # Remove old temp files
-```
-
-### Key Responsibilities Summary
+### Key Responsibilities
 
 | Responsibility | Description |
 |----------------|-------------|
 | Package storage | Store .ljc files, extract job.yaml metadata |
 | Registry management | Store registry.yaml, validate references |
 | Schedule enforcement | min/max_daily, track last execution times |
-| Data availability | Track which registers have data |
-| Register locking | Prevent concurrent writes |
-| Input preparation | Archive fs → MinIO, generate presigned URLs |
-| Output collection | MinIO → extract to fs, validate kind |
+| Register locking | ENQ/DEQ with all-or-nothing acquisition |
+| Input preparation | Archive fs -> MinIO, generate presigned URLs |
+| Output collection | MinIO -> extract to fs (write-through) |
 | Executor dispatch | Send job assignments via MQTT |
 | Progress tracking | Handle state updates, detect timeouts |
 
@@ -1094,13 +824,10 @@ linearjc-coordinator cleanup --age 24h      # Remove old temp files
 | Job validation | Done by `ljc validate` before deploy |
 | Isolation enforcement | Done by executor using `linearjc-core` |
 | Script execution | Done by executor |
-| Complex scheduling logic | Register-driven, emergent from reads/writes |
 
 ---
 
 ## Part 3: Executor
-
-*Placeholder - to be specified after ljc review*
 
 ### Overview
 
@@ -1115,25 +842,24 @@ Executor = linearjc-core + MQTT + I/O
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Executor Binary                                                │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────┐    ┌─────────────────────────────────────┐ │
-│  │  MQTT Client    │    │  linearjc-core (shared crate)       │ │
-│  │  • Subscribe    │    │  • Workdir setup                    │ │
-│  │  • Publish      │    │  • Isolation (Landlock, cgroups)    │ │
-│  │  • Progress     │    │  • Execution (fork, setuid, exec)   │ │
-│  └─────────────────┘    │  • Archive handling                 │ │
-│                         └─────────────────────────────────────┘ │
-│  ┌─────────────────┐                                            │
-│  │  I/O Layer      │    Same code as `ljc test`                │
-│  │  • Download in  │                                            │
-│  │  • Upload out   │                                            │
-│  │  • Package cache│                                            │
-│  └─────────────────┘                                            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------+
+|  Executor Binary                                                |
++-----------------------------------------------------------------+
+|                                                                 |
+|  +------------------+    +------------------------------------+ |
+|  |  MQTT Client     |    |  linearjc-core (shared crate)      | |
+|  |  - Subscribe     |    |  - Workdir setup                   | |
+|  |  - Publish       |    |  - Isolation (Landlock, cgroups)    | |
+|  |  - Progress      |    |  - Execution (fork, setuid, exec)  | |
+|  +------------------+    |  - Archive handling                 | |
+|                          +------------------------------------+ |
+|  +------------------+                                           |
+|  |  I/O Layer       |    Same code as ljc test                  |
+|  |  - Download in   |                                           |
+|  |  - Upload out    |                                           |
+|  |  - Package cache |                                           |
+|  +------------------+                                           |
++-----------------------------------------------------------------+
 ```
 
 ### Key Responsibilities
@@ -1144,6 +870,7 @@ Executor = linearjc-core + MQTT + I/O
 - Input preparation (download from registry to `in/`)
 - Output archiving (upload from `out/` to registry)
 - Progress reporting
+- Heartbeat publishing (every 30s with version and capabilities)
 
 **Delegated to linearjc-core (shared):**
 - Workdir creation and structure
@@ -1151,64 +878,16 @@ Executor = linearjc-core + MQTT + I/O
 - Script execution (fork, setuid, exec)
 - Timeout enforcement
 
-### Isolation Implementation
-
-Isolation is implemented in `linearjc-core` and shared with `ljc`:
-
-- **Same code path** in development (`ljc test`) and production (executor)
-- **Same Landlock rules** - no behavior differences
-- **Auditable** - security code in one place
-
 ### Output Capture
 
 Job output (stdout/stderr) is captured by the executor and included in progress messages.
 
-**Design principle:** Output is part of the execution result, not a separate logging concern.
-
-#### Capture Modes
-
 | Mode | When | Behavior |
 |------|------|----------|
 | **Buffered** | No active followers | Capture to buffer, send tail on completion |
-| **Streaming** | `ljc tail` / `ljc exec --follow` active | Send chunks periodically during execution |
+| **Streaming** | `ljc tail` / `ljc exec --follow` active | Send chunks periodically |
 
-The coordinator notifies the executor when a developer client attaches. The executor only streams chunks when someone is listening - otherwise it just buffers and sends the tail at completion.
-
-#### Progress Messages
-
-**During execution (streaming mode):**
-
-```json
-{
-  "execution_id": "build.musl-toolchain-20251204-191836",
-  "state": "running",
-  "elapsed_ms": 125000,
-  "output": {
-    "chunk": "  CC ldmain.o\n  CC ldwrite.o\n  CC ldexp.o\n",
-    "total_lines": 2341
-  }
-}
-```
-
-**On completion (any terminal state):**
-
-```json
-{
-  "execution_id": "build.musl-toolchain-20251204-191836",
-  "state": "failed",
-  "exit_code": 1,
-  "duration_ms": 212952,
-  "output": {
-    "tail": "...\n/bin/sh: rsync: not found\nmake: *** [Makefile:1361: headers_install] Error 127\nmake: *** [Makefile:182: all] Error 2\n",
-    "tail_lines": 100,
-    "total_lines": 5432
-  }
-}
-```
-
-#### Chunking Strategy
-
-Chunks are sent when any trigger fires:
+**Chunking triggers (streaming mode):**
 
 | Trigger | Default | Description |
 |---------|---------|-------------|
@@ -1216,57 +895,25 @@ Chunks are sent when any trigger fires:
 | Lines | 50 lines | Maximum lines per chunk |
 | Size | 32 KB | Maximum chunk size |
 
-#### Output Fields
-
-| Field | Present | Description |
-|-------|---------|-------------|
-| `output.chunk` | During execution | Lines since last progress message |
-| `output.tail` | On completion | Last N lines of total output |
-| `output.tail_lines` | On completion | Number of lines in tail (default: 100) |
-| `output.total_lines` | Always | Total lines produced so far |
-
-#### Coordinator Behavior
-
-1. **Forward chunks**: When developer client is attached, forward progress messages with output chunks
-2. **Store tail**: On completion, store output tail in execution history
-3. **Prune history**: Keep last N executions per job (default: 10)
-
-#### Developer Commands
-
-| Command | Source | Description |
-|---------|--------|-------------|
-| `ljc exec <job> --follow` | Streaming chunks | Trigger execution, stream output until completion |
-| `ljc tail <job>` | Streaming chunks | Attach to running execution, stream output |
-| `ljc logs <job>` | Stored tails | Show execution history with output tails |
+**Completion message includes:**
+- `output.tail`: Last N lines (default: 100)
+- `output.total_lines`: Total lines produced
+- `exit_code`: Script exit code
+- `duration_ms`: Total execution time
 
 ### Configuration
 
-```yaml
-executor:
-  id: executor-host-executor-01
+Executor reads environment variables:
 
-  mqtt:
-    broker: 192.0.2.10
-    port: 1883
-
-  minio:
-    endpoint: 192.0.2.10:9000
-    access_key: ${MINIO_ACCESS_KEY}
-    secret_key: ${MINIO_SECRET_KEY}
-
-  storage:
-    work_dir: /var/lib/linearjc/work
-    packages_dir: /var/lib/linearjc/packages
-
-  output:
-    tail_lines: 100           # Lines to include in completion message
-    chunk_interval_ms: 3000   # Max time between streaming chunks
-    chunk_max_lines: 50       # Max lines per chunk
-    chunk_max_bytes: 32768    # Max bytes per chunk
-
-  signing:
-    shared_secret: ${LINEARJC_SECRET}
-```
+| Variable | Description |
+|----------|-------------|
+| `EXECUTOR_ID` | Executor identity |
+| `MQTT_BROKER`, `MQTT_PORT` | MQTT connection |
+| `MQTT_SHARED_SECRET` | HMAC signing secret |
+| `MINIO_ENDPOINT`, `MINIO_SECURE` | MinIO connection |
+| `JOBS_DIR` | Package cache directory |
+| `WORK_DIR` | Working directory for job execution |
+| `CAPABILITIES` | Comma-separated capability types |
 
 ---
 
@@ -1277,47 +924,45 @@ executor:
 | Register | Named data location in the registry |
 | Registry | Collection of all register definitions |
 | Job | Unit of work with defined inputs, outputs, and schedule |
-| Job Tree | Current execution tree built from explicit chain dependencies |
+| Job Tree | Current execution unit built from explicit `depends:` links |
+| Batch Group | Planned: set of jobs that produce one batch result |
 | Batch Generation | One scheduled or manual execution of a batch group |
-| Barrier Job | Future multi-input job that waits for all input registers in the same batch generation |
+| Barrier Job | Planned: job that waits for multiple input registers from the same generation |
 | Execution | Single run of a job |
 | Package | Self-contained .ljc archive for deployment |
-| Workdir | Temporary directory where job executes (contains in/, out/, tmp/) |
-| Coordinator | Central scheduler (dumb, receives validated artifacts) |
-| Executor | Worker that runs jobs on Linux hosts (thin wrapper around linearjc-core) |
-| linearjc-core | Shared Rust crate containing security-critical execution code |
-| ljc | Developer CLI tool for job development, testing, and deployment |
+| Workdir | Temporary directory where job executes (in/, out/, tmp/) |
+| Coordinator | Central scheduler |
+| Executor | Worker that runs jobs (thin wrapper around linearjc-core) |
+| linearjc-core | Shared Rust crate with security-critical execution code |
+| ljc | Developer CLI tool |
 
 ## Appendix B: Migration Guide
 
-### From v0.5.x to v0.8.x (Phase 15 Register Model)
+### From v0.5.x to v0.8.x (Register Model)
 
 **Registry Changes:**
 
 1. **`kind` is now required for all types** (was only fs)
    ```yaml
-   # Before (v0.5.x)
+   # Before
    my_minio: {type: minio, bucket: data, prefix: foo/}
-
-   # After (v0.8.x)
+   # After
    my_minio: {type: minio, bucket: data, prefix: foo/, kind: dir}
    ```
 
 2. **New `temp` type for intermediates**
    ```yaml
-   # Before: Used fs for intermediates (unnecessary disk I/O)
+   # Before: Used fs for intermediates
    intermediate: {type: fs, path: /data/temp/intermediate.json, kind: file}
-
    # After: Use temp (MinIO only, auto-cleaned)
    intermediate: {type: temp, kind: file}
    ```
 
 3. **New `protect` flag for external inputs**
    ```yaml
-   # Before: No protection, jobs could accidentally overwrite
+   # Before: No protection
    source_db: {type: fs, path: /data/source.db, kind: file}
-
-   # After: Protected, jobs cannot write
+   # After: Protected
    source_db: {type: fs, path: /data/source.db, kind: file, protect: true}
    ```
 
@@ -1330,250 +975,42 @@ executor:
 | Executor crash | Lock held until timeout | Released after 90s (heartbeat) |
 | Hot reload | No validation | Safety checks block dangerous changes |
 
-**Migration Steps:**
-
-1. Add `kind` to all minio registry entries
-2. Consider converting intermediates to `type: temp`
-3. Add `protect: true` to external input registers
-4. Test with `ljc validate` before deploying
-
 **Backward Compatibility:**
-
 - Jobs with `type: fs` continue to work unchanged
-- Registry entries without `protect` default to `protect: false`
-- Existing chains work; they just benefit from write-through caching
-
----
+- `protect` defaults to `false`
+- Existing chains benefit from write-through caching automatically
 
 ## Appendix C: Crate Structure
 
 ```
-submodules/linearjc/
-├── crates/
-│   └── linearjc-core/              # Shared, auditable, security-critical
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs
-│           ├── workdir.rs          # Workdir creation and setup
-│           ├── isolation.rs        # Landlock, cgroups, network namespaces
-│           ├── execution.rs        # Fork, setuid, exec, timeout
-│           └── archive.rs          # Tar/gzip handling
-├── src/
-│   ├── coordinator/                # Python - scheduling, MQTT dispatch
-│   └── executor/                   # Rust - thin wrapper around linearjc-core
-│       ├── Cargo.toml              # Depends on linearjc-core
-│       └── src/
-│           ├── main.rs
-│           ├── mqtt.rs             # MQTT client
-│           └── io.rs               # Registry I/O (download/upload)
-└── tools/
-    └── ljc/                        # Rust - developer tool
-        ├── Cargo.toml              # Depends on linearjc-core
-        └── src/
-            ├── main.rs
-            ├── commands/
-            │   ├── test.rs         # Uses linearjc-core for execution
-            │   ├── build.rs
-            │   ├── validate.rs
-            │   └── ...
-            └── ...
+linearjc/
+  src/
+    linearjc-core/              # Rust - shared, auditable, security-critical
+      src/
+        lib.rs
+        workdir.rs              # Workdir creation and setup
+        isolation.rs            # Landlock, cgroups, network namespaces
+        execution.rs            # Fork, setuid, exec, timeout
+        archive.rs              # Tar/gzip handling
+        package.rs              # Package extraction and metadata
+        signing.rs              # HMAC message signing
+        job.rs                  # Job model types
+    coordinator/                # Python - shared utilities (models, signing, archive)
+    coordinator_v2/             # Python - async coordinator (aiomqtt)
+    executor/                   # Rust - thin wrapper around linearjc-core
+      Cargo.toml                # Depends on linearjc-core
+      src/
+        main.rs
+  tools/
+    ljc/                        # Rust - developer CLI
+      Cargo.toml                # Depends on linearjc-core
+      src/
+        main.rs
+        commands/
+          self_update.rs
+          ...
+  tests/
+    unit/                       # Python unit tests
+    integration/                # Integration tests
+  examples/                     # Example configs and jobs
 ```
-
----
-
-## Appendix D: Future Considerations
-
-### Single-Machine Mode
-
-`ljc run <job-id>` - Execute job directly on local machine without coordinator/executor.
-
-**Use case:** Simpler deployments where MQTT/MinIO infrastructure is overkill.
-
-**Constraints:**
-- Only `type: fs` registers supported (no MinIO)
-- No scheduling (user triggers via cron/systemd/manual)
-- Dependencies checked (upstream outputs must exist) but not enforced
-
-**Implementation:**
-- Uses `linearjc-core` (same isolation as distributed mode)
-- Reads inputs from actual registry paths → workdir `in/`
-- Writes outputs from workdir `out/` → actual registry paths
-
-**Compatibility:** Additive change, does not break distributed mode.
-
-**Evolution path:**
-```
-Phase 1 (current):  ljc test → build → deploy → coordinator → executor
-Phase 2 (future):   ljc run (single-machine, fs-only, immediate)
-Phase 3 (optional): ljc daemon (local scheduler)
-```
-
-### Coordinator Interaction (Implemented)
-
-Developer commands for interacting with the coordinator:
-
-| Command | Status | Description |
-|---------|--------|-------------|
-| `ljc exec <job-id> [--follow]` | ✅ Implemented | Trigger immediate execution, optionally stream output |
-| `ljc status [job-id] [--all]` | ✅ Implemented | Query job scheduling status |
-| `ljc tail <job-id\|exec-id>` | ✅ Implemented | Attach to running execution, stream output |
-| `ljc logs <job-id> [--last N]` | 🚧 In Progress | Show execution history with output tails |
-| `ljc ps [--all]` | ✅ Implemented | List active executions |
-| `ljc kill <exec-id> [--force]` | ✅ Implemented | Cancel running execution |
-| `ljc self-update [--check]` | ✅ Implemented | Update ljc to latest version from coordinator |
-
-See **Part 3: Executor → Output Capture** for the output streaming specification.
-
-### Tool Self-Update
-
-ljc can update itself to the latest version from the coordinator:
-
-```bash
-# Check for updates without installing
-ljc self-update --check
-
-# Download and install update
-ljc self-update
-```
-
-**Coordinator configuration:**
-```yaml
-coordinator:
-  tools_registry: /var/lib/linearjc/tools-registry.yaml
-```
-
-**Tools registry format:**
-```yaml
-tools:
-  ljc:
-    x86_64-unknown-linux-musl:
-      version: "0.2.0"
-      checksum_sha256: "a1b2c3d4..."
-      size_bytes: 4521984
-      path: "tools/ljc-0.2.0-x86_64-linux-musl"
-```
-
-Artifacts are stored in the MinIO temp bucket and served via presigned URLs.
-
-### Mainframe-Inspired Features
-
-Features from JCL/JES that would add operational resilience:
-
-#### Generation Data Groups (GDG)
-
-Automatic versioning of registers with rolling retention:
-
-```yaml
-registry:
-  daily_report:
-    type: fs
-    path: /var/share/reports/daily
-    kind: dir
-    generations: 7          # Keep last 7 versions
-```
-
-```yaml
-job:
-  reads: [daily_report(0)]    # Current generation
-  writes: [daily_report(+1)]  # Create next generation
-  # reads: [daily_report(-1)] # Previous generation (for comparison)
-```
-
-**Value:** Audit trail, rollback capability, automatic retention management.
-
-#### Conditional Execution
-
-Run jobs based on previous job's exit code:
-
-```yaml
-job:
-  id: report.daily
-  reads: [processed_data]
-  writes: [report]
-  condition:
-    when: processed_data.exit_code <= 4    # Run even on warnings (1-4)
-    skip_on: processed_data.exit_code > 4  # Skip on errors
-```
-
-**Value:** Graceful handling of partial success, skip expensive steps on warnings.
-
-#### Dataset Disposition (DISP)
-
-Declarative cleanup behavior on success/failure:
-
-```yaml
-job:
-  writes:
-    temp_work:
-      register: work_area
-      on_success: delete      # Cleanup temp data
-      on_failure: keep        # Preserve for debugging
-    final_output:
-      register: report
-      on_success: catalog     # Make available
-      on_failure: delete      # Don't leave partial data
-```
-
-**Value:** Atomic success/failure handling, automatic cleanup.
-
-#### Checkpoint/Restart
-
-For long-running jobs, save progress and allow restart:
-
-```yaml
-job:
-  id: big.migration
-  run:
-    timeout: 14400            # 4 hours
-    checkpoint:
-      enabled: true
-      interval: 300           # Every 5 minutes
-      register: migration_checkpoint
-```
-
-On failure: `ljc restart big.migration --from-checkpoint`
-
-**Value:** Don't lose hours of work on late-stage failure.
-
-#### Procedure Templates (PROC)
-
-Reusable job templates with parameters:
-
-```yaml
-# templates/etl.yaml
-template:
-  id: standard-etl
-  parameters:
-    source: {required: true}
-    dest: {required: true}
-    format: {default: csv}
-  job:
-    reads: [${source}]
-    writes: [${dest}]
-    run:
-      entry: etl.sh
-      env:
-        FORMAT: ${format}
-```
-
-```bash
-ljc new daily.sales --template standard-etl --source=raw_sales --dest=processed_sales
-```
-
-**Value:** Standardization, DRY principle, organizational patterns.
-
-### Priority Assessment
-
-| Feature | Effort | Value | Priority |
-|---------|--------|-------|----------|
-| Generation Data Groups | Medium | High | P1 |
-| Conditional execution | Low | Medium | P2 |
-| DISP semantics | Low | Medium | P2 |
-| Checkpoint/restart | High | High | P3 (for long jobs only) |
-| PROC templates | Medium | Medium | P3 |
-
-### Other
-
-- Additional register types (database, API endpoints)
-- `ljc watch` - Real-time TUI dashboard of job activity
-- Coordinator REST/gRPC interface (hide MQTT/MinIO complexity)
