@@ -66,7 +66,17 @@ Each batch execution gets a generation ID. Temp registers are scoped to that gen
 
 Connects to future GDG (Generation Data Group) support for versioned register retention and rollback.
 
-### 3. Observability
+### 3. Step-level restart
+
+**Motivation**: Avoid re-running expensive completed steps after a late-chain failure.
+
+When step 3 of a 5-step chain fails, the current model reruns the entire chain from the root. For a 6-hour simulation followed by post-processing, a failure in the last step wastes 6 hours of recomputation.
+
+Step-level restart skips steps whose outputs are still valid for the current generation. The coordinator checks whether each step's output registers already contain data for this generation ID, and resumes from the first step that needs to run.
+
+Depends on generation tracking (priority 2): without generation scoping, the coordinator cannot distinguish "this output is from the current run" from "this is stale data from yesterday." Generation IDs make the validity check deterministic.
+
+### 4. Observability
 
 **Motivation**: Production debugging is currently blind.
 
@@ -78,13 +88,13 @@ Connects to future GDG (Generation Data Group) support for versioned register re
 
 See `docs/phase16-notes.md` for the full list of gaps found during production testing.
 
-### 4. Atomic deployment sets
+### 5. Atomic deployment sets
 
 **Motivation**: Safe coordinated job updates.
 
 A `ljc deploy-set` command that pushes multiple packages and a registry update as one batch. The coordinator applies the new configuration atomically on the next reload. In-flight batch generations finish with old versions; new generations use the new set.
 
-### 5. Execution archives
+### 6. Execution archives
 
 **Motivation**: Audit trail and failure analysis.
 
