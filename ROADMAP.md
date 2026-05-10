@@ -64,6 +64,30 @@ This replaces `JobTree`/`TreeExecution` with `BatchGraph`/`BatchExecution` in th
 
 Each batch execution gets a generation ID. Temp registers are scoped to that generation. Barrier jobs wait for all input registers to be ready within the same generation. This prevents stale data mixing after partial failures.
 
+**Implementation: symlink-based generations on filesystem**
+
+Write-through no longer writes directly to the register path. Instead, each `fs` register uses a directory layout with a `current` symlink:
+
+```
+/data/registers/daily_report/
+  current -> generations/gen-20260510-001    # symlink = committed state
+  generations/
+    gen-20260510-001/                        # previous committed generation
+  staging/
+    gen-20260510-002/                        # batch in progress
+```
+
+Flow during a batch generation:
+1. Coordinator creates `staging/{generation_id}/` for each output register
+2. Write-through from MinIO extracts to the staging path (not `current`)
+3. Other jobs reading the register follow the `current` symlink — never see staging
+4. On batch completion: move staging to `generations/`, update symlink (pseudo-atomic via POSIX `ln -sfn` + `mv`)
+5. On batch failure: delete staging directory — `current` unchanged
+
+This separates "in-progress" from "committed" at the path level. MinIO remains the data transfer mechanism between executor and coordinator; the symlink model only changes where the coordinator writes on the filesystem side.
+
+Previous generations are retained under `generations/` for rollback, audit (`diff` between generations), and future GDG support. Retention policy controls how many generations to keep.
+
 Connects to future GDG (Generation Data Group) support for versioned register retention and rollback.
 
 ### 3. Step-level restart
